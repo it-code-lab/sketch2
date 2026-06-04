@@ -8,6 +8,7 @@ SubjectType = Literal["auto", "portrait", "architecture", "pet", "product", "lan
 SketchStyle = Literal["pencil", "charcoal", "ink", "marker"]
 Ratio = Literal["9:16", "1:1", "16:9"]
 TraceMode = Literal["opencv", "potrace", "vtracer", "auto"]
+StrokeExtractionMode = Literal["hybrid", "centerline", "contour"]
 PlanningMode = Literal["rule", "art_director_json"]
 HandMode = Literal["procedural", "uploaded", "none"]
 
@@ -35,6 +36,7 @@ class RenderSettings:
 
     # Batch 3 premium controls.
     trace_mode: TraceMode = "opencv"
+    stroke_extraction_mode: StrokeExtractionMode = "hybrid"
     planning_mode: PlanningMode = "rule"
     art_director_json: str = ""
     camera_motion: bool = True
@@ -89,6 +91,7 @@ class RenderSettings:
             pencil_audio=b("pencil_audio", True),
             seed=i("seed", 12345, 1, 2_000_000_000),
             trace_mode=s("trace_mode", "opencv"),
+            stroke_extraction_mode=s("stroke_extraction_mode", "hybrid"),
             planning_mode=s("planning_mode", "rule"),
             art_director_json=s("art_director_json", ""),
             camera_motion=b("camera_motion", True),
@@ -167,6 +170,8 @@ class StrokePlan:
     pass_summary: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     art_director: dict[str, Any] = field(default_factory=dict)
+    semantic_regions: list[dict[str, Any]] = field(default_factory=list)
+    layer_plan: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self, include_strokes: bool = True) -> dict[str, Any]:
         payload = {
@@ -176,6 +181,8 @@ class StrokePlan:
             "pass_summary": self.pass_summary,
             "warnings": self.warnings,
             "art_director": self.art_director,
+            "semantic_regions": self.semantic_regions,
+            "layer_plan": self.layer_plan,
         }
         if include_strokes:
             payload["strokes"] = [stroke.to_dict() for stroke in self.strokes]

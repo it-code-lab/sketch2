@@ -12,13 +12,14 @@ const videoOutput = $('videoOutput');
 const sourcePreview = $('sourcePreview');
 const sketchPreview = $('sketchPreview');
 const passSummary = $('passSummary');
+const semanticSummary = $('semanticSummary');
 const healthBox = $('healthBox');
 
 const fields = [
   'input_type', 'subject_type', 'style_type', 'ratio', 'sketch_strength', 'stroke_density',
   'human_randomness', 'duration_seconds', 'fps', 'max_strokes', 'paper_texture',
   'construction_pass', 'accent_pass', 'hand_overlay', 'pencil_audio', 'seed', 'trace_mode',
-  'planning_mode', 'art_director_json', 'camera_motion', 'smudge_pass', 'eraser_pass',
+  'stroke_extraction_mode', 'planning_mode', 'art_director_json', 'camera_motion', 'smudge_pass', 'eraser_pass',
   'title_card_text', 'watermark_text', 'hand_mode', 'hand_scale', 'hand_opacity',
   'hand_rotation', 'hand_tip_x', 'hand_tip_y'
 ];
@@ -98,6 +99,7 @@ analyzeBtn.addEventListener('click', async () => {
     sketchPreview.src = data.sketch_preview;
     sketchPreview.classList.remove('placeholder');
     renderPassSummary(data.plan.pass_summary || []);
+    renderSemanticSummary(data.plan.semantic_regions || [], data.plan.layer_plan || []);
     log(`Plan ready: ${data.plan.stroke_count} strokes, subject ${data.plan.subject_type}`, data.plan.warnings || []);
   } catch (err) {
     log(err.message || String(err));
@@ -148,6 +150,7 @@ async function pollJob(jobId) {
 function handleRenderResult(result) {
   if (!result) return;
   renderPassSummary(result.pass_summary || []);
+  renderSemanticSummary(result.semantic_regions || [], result.layer_plan || []);
   const files = result.files || {};
   downloadLinks.innerHTML = '';
   for (const [name, url] of Object.entries(files)) {
@@ -176,4 +179,24 @@ function renderPassSummary(rows) {
       <span>${row.description}<br>${Math.round(row.start_ms / 100) / 10}s – ${Math.round(row.end_ms / 100) / 10}s</span>
     </div>
   `).join('');
+}
+
+
+function renderSemanticSummary(regions, layerPlan) {
+  if (!regions.length) {
+    semanticSummary.className = 'pass-summary empty';
+    semanticSummary.textContent = 'No semantic regions detected.';
+    return;
+  }
+  const focus = new Map((layerPlan || []).map(row => [row.id, row.focus_regions || []]));
+  semanticSummary.className = 'pass-summary';
+  semanticSummary.innerHTML = regions.slice(0, 12).map(region => {
+    const layers = Object.entries(Object.fromEntries([...focus].filter(([, names]) => names.includes(region.name)))).map(([name]) => name);
+    return `
+      <div class="pass-card">
+        <strong>${region.name} · ${(region.confidence * 100).toFixed(0)}% confidence</strong>
+        <span>Role: ${region.role} · Priority: ${region.priority}<br>Layers: ${layers.join(', ') || region.preferred_layers?.join(', ') || 'n/a'}</span>
+      </div>
+    `;
+  }).join('');
 }

@@ -145,7 +145,8 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
     # Drawing all strokes from scratch per frame is expensive, so cache completed strokes onto a base image.
     completed = background.copy().convert("RGBA")
     last_completed_index = -1
-    active_cache: dict[int, Image.Image] = {}
+    hand_tip_smoothed: tuple[float, float] | None = None
+    hand_angle_smoothed: float | None = None
 
     for frame_idx in range(total_frames):
         if progress_callback and (frame_idx == 0 or frame_idx % max(1, total_frames // 40) == 0):
@@ -158,22 +159,122 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
             last_completed_index += 1
             draw_stroke(completed, strokes[last_completed_index], settings, progress=1.0)
 
-        active_tip: tuple[float, float] | None = None
+        active_state: dict[str, object] | None = None
         for idx in range(last_completed_index + 1, len(strokes)):
             stroke = strokes[idx]
             if stroke.start_ms <= t <= stroke.end_ms:
                 progress = (t - stroke.start_ms) / max(1, stroke.duration_ms)
-                active_tip = partial_tip(stroke.points, progress)
+                tip, heading = partial_tip_and_heading(stroke.points, progress)
+                active_state = {"tip": tip, "heading": heading, "contact": True, "lift": 0.0}
                 draw_stroke(frame, stroke, settings, progress=progress)
             elif stroke.start_ms > t:
                 break
 
-        if settings.hand_overlay and active_tip is not None:
-            draw_hand_overlay(frame, active_tip, settings, frame_idx)
+        if active_state is None:
+            active_state = reposition_hand_state(strokes, last_completed_index, t)
+
+        if settings.hand_overlay and active_state is not None:
+            desired_tip = active_state["tip"]  # type: ignore[assignment]
+            desired_angle = float(active_state.get("heading", 0.0))
+            if hand_tip_smoothed is None:
+                hand_tip_smoothed = desired_tip  # type: ignore[assignment]
+            else:
+                hand_tip_smoothed = smooth_point(hand_tip_smoothed, desired_tip, 0.38 if active_state.get("contact") else 0.22)  # type: ignore[arg-type]
+            if hand_angle_smoothed is None:
+                hand_angle_smoothed = desired_angle
+            else:
+                hand_angle_smoothed = smooth_angle(hand_angle_smoothed, desired_angle, 0.22)
+            draw_hand_overlay(
+                frame,
+                hand_tip_smoothed,
+                settings,
+                frame_idx,
+                heading=hand_angle_smoothed,
+                contact=bool(active_state.get("contact", True)),
+                lift=float(active_state.get("lift", 0.0)),
+            )
 
         apply_camera_motion_and_labels(frame, settings, frame_idx, total_frames)
         frame.convert("RGB").save(frames_dir / f"frame_{frame_idx:05d}.png", optimize=False)
 
+
+
+def reposition_hand_state(strokes: list[Stroke], last_completed_index: int, t: float) -> dict[str, object] | None:
+    """Move the hand between strokes instead of popping it off-screen.
+
+    During pauses, the hand follows a small lifted arc from the previous stroke end
+    to the next stroke start. This makes the animation look like a real artist
+    repositioning their hand before drawing again.
+    """
+    if not strokes:
+        return None
+    next_index = last_completed_index + 1
+    if next_index >= len(strokes):
+        last = strokes[-1]
+        tip, heading = partial_tip_and_heading(last.points, 1.0)
+        return {"tip": tip, "heading": heading, "contact": False, "lift": 1.0}
+    next_stroke = strokes[next_index]
+    if last_completed_index < 0:
+        start = next_stroke.points[0]
+        return {"tip": start, "heading": stroke_initial_heading(next_stroke), "contact": False, "lift": 1.0}
+    previous = strokes[last_completed_index]
+    gap_start = previous.end_ms
+    gap_end = next_stroke.start_ms
+    if gap_end <= gap_start:
+        return None
+    gap = gap_end - gap_start
+    if gap > 1600:
+        # For long planning pauses, hide the hand until it is close to the next action.
+        if t < gap_end - 850:
+            return None
+        gap_start = gap_end - 850
+        gap = gap_end - gap_start
+    u = max(0.0, min(1.0, (t - gap_start) / max(1.0, gap)))
+    eased = ease_in_out(u)
+    a = previous.points[-1]
+    b = next_stroke.points[0]
+    arc_height = min(42.0, 10.0 + distance(a, b) * 0.10)
+    x = a[0] + (b[0] - a[0]) * eased
+    y = a[1] + (b[1] - a[1]) * eased - math.sin(math.pi * eased) * arc_height
+    heading = interpolate_angle(stroke_final_heading(previous), stroke_initial_heading(next_stroke), eased)
+    lift = math.sin(math.pi * u)
+    return {"tip": (x, y), "heading": heading, "contact": False, "lift": lift}
+
+
+def smooth_point(current: tuple[float, float], target: tuple[float, float], amount: float) -> tuple[float, float]:
+    return (current[0] + (target[0] - current[0]) * amount, current[1] + (target[1] - current[1]) * amount)
+
+
+def smooth_angle(current: float, target: float, amount: float) -> float:
+    diff = math.atan2(math.sin(target - current), math.cos(target - current))
+    return current + diff * amount
+
+
+def interpolate_angle(a: float, b: float, u: float) -> float:
+    return smooth_angle(a, b, u)
+
+
+def ease_in_out(u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    return u * u * (3 - 2 * u)
+
+
+def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def stroke_initial_heading(stroke: Stroke) -> float:
+    if len(stroke.points) < 2:
+        return 0.0
+    a, b = stroke.points[0], stroke.points[1]
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def stroke_final_heading(stroke: Stroke) -> float:
+    if len(stroke.points) < 2:
+        return 0.0
+    a, b = stroke.points[-2], stroke.points[-1]
+    return math.atan2(b[1] - a[1], b[0] - a[0])
 
 
 def apply_camera_motion_and_labels(frame: Image.Image, settings: RenderSettings, frame_idx: int, total_frames: int) -> None:
@@ -293,16 +394,54 @@ def draw_textured_line(draw: ImageDraw.ImageDraw, points: list[tuple[float, floa
                     draw.line([a, b], fill=(255, 255, 255, min(45, fill[3] // 3)), width=max(1, width - 1))
 
 
-def draw_hand_overlay(image: Image.Image, tip: tuple[float, float], settings: RenderSettings, frame_idx: int) -> None:
+def draw_hand_overlay(
+    image: Image.Image,
+    tip: tuple[float, float],
+    settings: RenderSettings,
+    frame_idx: int,
+    heading: float = 0.0,
+    contact: bool = True,
+    lift: float = 0.0,
+) -> None:
     if getattr(settings, "hand_mode", "procedural") == "none":
         return
+    # Lift the visual hand/tip slightly during repositioning while keeping the
+    # logical pencil tip aligned with the stroke endpoint.
+    lifted_tip = (tip[0], tip[1] - lift * 14.0)
     if getattr(settings, "hand_mode", "procedural") == "uploaded" and getattr(settings, "hand_asset_path", ""):
-        if draw_uploaded_hand_overlay(image, tip, settings, frame_idx):
+        if draw_uploaded_hand_overlay(image, lifted_tip, settings, frame_idx, heading, contact, lift):
             return
-    draw_procedural_hand_overlay(image, tip, settings, frame_idx)
+    draw_procedural_hand_overlay(image, lifted_tip, settings, frame_idx, heading, contact, lift)
 
 
-def draw_uploaded_hand_overlay(image: Image.Image, tip: tuple[float, float], settings: RenderSettings, frame_idx: int) -> bool:
+def draw_contact_shadow(image: Image.Image, tip: tuple[float, float], contact: bool, lift: float) -> None:
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    x, y = tip
+    alpha = int(58 if contact else max(12, 34 * (1 - lift)))
+    radius_x = 17 + lift * 16
+    radius_y = 5 + lift * 5
+    draw.ellipse((x - radius_x, y + 5 - radius_y, x + radius_x, y + 5 + radius_y), fill=(25, 20, 15, alpha))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=3.4 + lift * 2.0))
+    image.alpha_composite(overlay)
+
+
+def alpha_shadow(asset: Image.Image, opacity: int = 72, blur: float = 5.5) -> Image.Image:
+    alpha = asset.getchannel("A")
+    shadow = Image.new("RGBA", asset.size, (0, 0, 0, 0))
+    shadow.putalpha(alpha.point(lambda v: int(v * opacity / 255)))
+    return shadow.filter(ImageFilter.GaussianBlur(radius=blur))
+
+
+def draw_uploaded_hand_overlay(
+    image: Image.Image,
+    tip: tuple[float, float],
+    settings: RenderSettings,
+    frame_idx: int,
+    heading: float,
+    contact: bool,
+    lift: float,
+) -> bool:
     path = Path(getattr(settings, "hand_asset_path", ""))
     if not path.exists():
         return False
@@ -311,15 +450,18 @@ def draw_uploaded_hand_overlay(image: Image.Image, tip: tuple[float, float], set
     except Exception:
         return False
 
+    draw_contact_shadow(image, tip, contact, lift)
     base_side = min(settings.width, settings.height)
     target_w = max(32, int(base_side * (settings.hand_scale / 100)))
     scale = target_w / max(1, asset.width)
     target_h = max(32, int(asset.height * scale))
     asset = asset.resize((target_w, target_h), Image.LANCZOS)
 
-    # Small live wobble helps even static assets feel filmed.
-    wobble = math.sin(frame_idx * 0.11) * 1.4
-    rotation = settings.hand_rotation + wobble
+    # Small live wobble helps even static assets feel filmed. We also allow the
+    # hand to respond slightly to stroke direction without spinning too much.
+    wobble = math.sin(frame_idx * 0.11) * (1.2 if contact else 2.0)
+    heading_degrees = math.degrees(heading) * 0.10
+    rotation = settings.hand_rotation + heading_degrees + wobble + lift * 3.0
     anchor = (asset.width * settings.hand_tip_x / 100, asset.height * settings.hand_tip_y / 100)
     rotated, rotated_anchor = rotate_with_anchor(asset, rotation, anchor)
 
@@ -329,7 +471,9 @@ def draw_uploaded_hand_overlay(image: Image.Image, tip: tuple[float, float], set
 
     x, y = tip
     paste_x = int(x - rotated_anchor[0])
-    paste_y = int(y - rotated_anchor[1])
+    paste_y = int(y - rotated_anchor[1] - lift * 10)
+    shadow = alpha_shadow(rotated, opacity=54 if contact else 34, blur=5.5 + lift * 3)
+    image.alpha_composite(shadow, (paste_x + int(7 + lift * 6), paste_y + int(9 + lift * 8)))
     image.alpha_composite(rotated, (paste_x, paste_y))
     return True
 
@@ -355,30 +499,47 @@ def rotate_with_anchor(asset: Image.Image, angle_degrees: float, anchor: tuple[f
     return rotated, (anchor_rot[0] - min_x, anchor_rot[1] - min_y)
 
 
-def draw_procedural_hand_overlay(image: Image.Image, tip: tuple[float, float], settings: RenderSettings, frame_idx: int) -> None:
+def draw_procedural_hand_overlay(
+    image: Image.Image,
+    tip: tuple[float, float],
+    settings: RenderSettings,
+    frame_idx: int,
+    heading: float,
+    contact: bool,
+    lift: float,
+) -> None:
     x, y = tip
+    draw_contact_shadow(image, tip, contact, lift)
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
-    phase = math.sin(frame_idx * 0.14) * 2.0
-    # Brush/pencil body.
-    pencil_angle = math.radians(settings.hand_rotation) if hasattr(settings, "hand_rotation") else -0.70
+    phase = math.sin(frame_idx * 0.14) * (1.2 if contact else 2.8)
+    # Pencil body follows stroke direction a little, while preserving the user
+    # supplied hand_rotation as the main grip angle.
+    base_angle = math.radians(settings.hand_rotation) if hasattr(settings, "hand_rotation") else -0.70
+    pencil_angle = base_angle + heading * 0.13 + lift * 0.08
     length = 145 if settings.ratio != "16:9" else 105
     back_x = x + math.cos(pencil_angle) * length
-    back_y = y + math.sin(pencil_angle) * length
+    back_y = y + math.sin(pencil_angle) * length - lift * 12
     opacity = int(2.55 * getattr(settings, "hand_opacity", 95))
+
+    # Pencil shadow under the barrel.
+    draw.line([(back_x + 8, back_y + 11 + lift * 5), (x + 8, y + 11 + lift * 5)], fill=(20, 16, 12, 45 if contact else 26), width=13)
     draw.line([(back_x, back_y), (x, y)], fill=(91, 62, 38, min(230, opacity)), width=10)
     draw.line([(back_x + 4, back_y + 2), (x + 4, y + 2)], fill=(245, 202, 112, min(190, opacity)), width=3)
-    draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(25, 21, 18, min(240, opacity)))
+    tip_alpha = min(245, opacity) if contact else min(150, opacity)
+    draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(25, 21, 18, tip_alpha))
+
     # Stylized hand shadow/fingers near the pencil.
     palm_x, palm_y = back_x + 32, back_y + 28 + phase
-    draw.ellipse((palm_x - 32, palm_y - 22, palm_x + 45, palm_y + 34), fill=(176, 126, 86, min(135, opacity // 2)))
+    shadow_alpha = 54 if contact else 34
+    draw.ellipse((palm_x - 42, palm_y - 16 + lift * 5, palm_x + 54, palm_y + 44 + lift * 5), fill=(20, 16, 12, shadow_alpha))
+    draw.ellipse((palm_x - 32, palm_y - 22, palm_x + 45, palm_y + 34), fill=(176, 126, 86, min(145, opacity // 2)))
     for i in range(4):
         fx = palm_x - 18 + i * 15
-        fy = palm_y + 4 + math.sin(frame_idx * 0.09 + i) * 1.8
-        draw.rounded_rectangle((fx, fy, fx + 12, fy + 56), radius=6, fill=(183, 132, 91, min(145, opacity // 2)))
+        fy = palm_y + 4 + math.sin(frame_idx * 0.09 + i) * (1.6 if contact else 3.2)
+        draw.rounded_rectangle((fx, fy, fx + 12, fy + 56), radius=6, fill=(183, 132, 91, min(150, opacity // 2)))
     overlay = overlay.filter(ImageFilter.GaussianBlur(radius=0.35))
     image.alpha_composite(overlay)
-
 
 def partial_polyline(points: list[tuple[float, float]], progress: float) -> list[tuple[float, float]]:
     if progress >= 1:
@@ -404,3 +565,18 @@ def partial_polyline(points: list[tuple[float, float]], progress: float) -> list
 def partial_tip(points: list[tuple[float, float]], progress: float) -> tuple[float, float]:
     partial = partial_polyline(points, progress)
     return partial[-1]
+
+
+def partial_tip_and_heading(points: list[tuple[float, float]], progress: float) -> tuple[tuple[float, float], float]:
+    partial = partial_polyline(points, progress)
+    if not partial:
+        return ((0.0, 0.0), 0.0)
+    tip = partial[-1]
+    if len(partial) >= 2:
+        prev = partial[-2]
+    elif len(points) >= 2:
+        prev = points[0]
+    else:
+        prev = tip
+    heading = math.atan2(tip[1] - prev[1], tip[0] - prev[0])
+    return tip, heading

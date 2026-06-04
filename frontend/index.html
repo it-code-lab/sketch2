@@ -9,9 +9,9 @@
 <body>
   <header class="hero">
     <div>
-      <p class="eyebrow">Batch 3 Premium Local App</p>
+      <p class="eyebrow">Batch 5 Centerline + Hand Realism Upgrade</p>
       <h1>AI Street Sketch Video Studio</h1>
-      <p class="subtitle">Turn a final image or sketch into a realistic street-artist drawing video with human-like passes, real hand overlay support, pencil audio, and MP4 export.</p>
+      <p class="subtitle">Turn a final image or sketch into a realistic street-artist drawing video with true centerline stroke extraction, semantic layer planning, smoother hand movement, real hand overlay support, pencil audio, and MP4 export.</p>
     </div>
     <div class="health" id="healthBox">Checking backend…</div>
   </header>
@@ -46,6 +46,9 @@
       <div class="grid two">
         <label>Trace mode
           <select id="trace_mode"><option value="opencv">OpenCV strokes</option><option value="auto">Auto SVG sidecar</option><option value="potrace">Potrace sidecar</option><option value="vtracer">VTracer sidecar</option></select>
+        </label>
+        <label>Stroke extraction
+          <select id="stroke_extraction_mode"><option value="hybrid">Hybrid centerline + contour</option><option value="centerline">True centerline only</option><option value="contour">Contour fallback only</option></select>
         </label>
         <label>Planning mode
           <select id="planning_mode"><option value="rule">Rule-based artist order</option><option value="art_director_json">Art Director JSON</option></select>
@@ -159,6 +162,8 @@
       <div class="download-links" id="downloadLinks"></div>
       <h3>Pass summary</h3>
       <div id="passSummary" class="pass-summary empty">Analyze an image to see the artist passes.</div>
+      <h3>Semantic regions</h3>
+      <div id="semanticSummary" class="pass-summary empty">Analyze an image to see detected semantic regions and layer focus.</div>
       <h3>Warnings / logs</h3>
       <pre id="logBox">Ready.</pre>
     </section>

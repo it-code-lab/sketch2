@@ -13,6 +13,14 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from backend.models import RenderSettings, Stroke, StrokePlan
+from backend.services.centerline_extractor import make_centerline_paths
+from backend.services.semantic_planning import (
+    SemanticRegion,
+    build_layer_plan,
+    decide_semantic_layer,
+    detect_semantic_regions,
+    select_region_for_stroke,
+)
 
 PASS_NAMES = {
     "layout": "Loose construction",
@@ -159,14 +167,26 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if art_director.get("subject_type"):
         subject = str(art_director["subject_type"])
 
+    semantic_regions = detect_semantic_regions(darkness, subject, settings.width, settings.height)
+    layer_plan = build_layer_plan(subject, semantic_regions)
+
     strokes: list[Stroke] = []
 
     if settings.construction_pass:
-        strokes.extend(create_layout_strokes(darkness, subject, settings, rng))
+        strokes.extend(create_layout_strokes(darkness, subject, settings, rng, semantic_regions))
 
-    contour_strokes = extract_contour_strokes(sketch, darkness, subject, settings, rng)
+    extraction_mode = getattr(settings, "stroke_extraction_mode", "hybrid")
+    contour_strokes: list[Stroke] = []
+    centerline_strokes: list[Stroke] = []
+    if extraction_mode in {"contour", "hybrid"}:
+        contour_strokes = extract_contour_strokes(sketch, darkness, subject, settings, rng)
+    if extraction_mode in {"centerline", "hybrid"}:
+        centerline_strokes = extract_centerline_strokes(sketch, darkness, subject, settings, rng)
     hatch_strokes = extract_hatching_strokes(darkness, subject, settings, rng)
     accent_strokes = extract_accent_strokes(sketch, darkness, subject, settings, rng) if settings.accent_pass else []
+    # Centerline strokes are closer to real pen/pencil movement. In hybrid mode,
+    # keep contours for strong silhouettes but let centerlines handle internal details.
+    strokes.extend(centerline_strokes)
     strokes.extend(contour_strokes)
     strokes.extend(hatch_strokes)
     strokes.extend(accent_strokes)
@@ -179,6 +199,7 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if not strokes:
         strokes.extend(create_fallback_strokes(settings, rng))
 
+    apply_semantic_region_detection(strokes, semantic_regions)
     apply_art_director_to_strokes(strokes, art_director, settings)
 
     # Limit total strokes while preserving layer variety.
@@ -194,11 +215,41 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if settings.pencil_audio and settings.duration_seconds > 90:
         warnings.append("Long audio tracks are generated procedurally and may sound repetitive.")
     if settings.trace_mode != "opencv":
-        warnings.append("Vector tracing hook is enabled. If Potrace/VTracer is installed, the renderer can export SVG sidecars; OpenCV strokes are still used for animation in Batch 3.")
+        warnings.append("Vector tracing hook is enabled. If Potrace/VTracer is installed, the renderer can export SVG sidecars; OpenCV strokes are still used for animation in Batch 4.")
     if settings.planning_mode == "art_director_json" and not art_director:
         warnings.append("Art Director JSON mode was selected, but no valid JSON plan was provided. Rule-based planning was used.")
+    if getattr(settings, "stroke_extraction_mode", "hybrid") in {"centerline", "hybrid"}:
+        center_count = sum(1 for stroke in strokes if stroke.id.startswith("centerline_"))
+        if center_count < 30:
+            warnings.append("Centerline extraction produced few strokes. Try higher sketch strength or switch to Hybrid mode for stronger contour backup.")
+    if not semantic_regions:
+        warnings.append("Semantic region detection returned no focused regions, so generic artist planning was used.")
 
-    return StrokePlan(subject, settings.to_dict(), strokes, summary, warnings, art_director), source, preview
+    return StrokePlan(
+        subject,
+        settings.to_dict(),
+        strokes,
+        summary,
+        warnings,
+        art_director,
+        semantic_regions=[region.to_dict() for region in semantic_regions],
+        layer_plan=layer_plan,
+    ), source, preview
+
+
+
+def apply_semantic_region_detection(strokes: list[Stroke], semantic_regions: list[SemanticRegion]) -> None:
+    if not semantic_regions:
+        return
+    for stroke in strokes:
+        x1, y1, x2, y2 = stroke.bbox
+        center = ((x1 + x2) / 2, (y1 + y2) / 2)
+        region = select_region_for_stroke(stroke.bbox, center, semantic_regions)
+        if region is None:
+            continue
+        stroke.region = region.name
+        stroke.layer = decide_semantic_layer(stroke.layer, region, stroke.length, stroke.darkness, stroke.effect)
+        stroke.order_score = min(stroke.order_score, LAYER_WEIGHT.get(stroke.layer, 50) + region.priority)
 
 
 
@@ -271,7 +322,7 @@ def apply_art_director_to_order(strokes: list[Stroke], plan: dict[str, object]) 
             pass
     strokes.sort(key=lambda s: (s.order_score, s.region, s.start_ms))
 
-def create_layout_strokes(darkness: np.ndarray, subject: str, settings: RenderSettings, rng: random.Random) -> list[Stroke]:
+def create_layout_strokes(darkness: np.ndarray, subject: str, settings: RenderSettings, rng: random.Random, semantic_regions: list[SemanticRegion] | None = None) -> list[Stroke]:
     h, w = darkness.shape
     ys, xs = np.where(darkness > 0.12)
     if len(xs) < 20:
@@ -281,13 +332,15 @@ def create_layout_strokes(darkness: np.ndarray, subject: str, settings: RenderSe
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     bw, bh = x2 - x1, y2 - y1
     strokes: list[Stroke] = []
+    region_lookup = {region.name: region for region in (semantic_regions or [])}
 
-    def add(points: list[tuple[float, float]], name: str, opacity: float = 0.14):
+    def add(points: list[tuple[float, float]], name: str, opacity: float = 0.14, region_name: str | None = None):
+        region = region_name or region_from_point(cx, cy, subject, settings.width, settings.height)
         strokes.append(build_stroke(
             f"layout_{name}_{len(strokes)}",
             points,
             "layout",
-            region_from_point(cx, cy, subject, settings.width, settings.height),
+            region,
             0.12,
             settings,
             rng,
@@ -297,20 +350,56 @@ def create_layout_strokes(darkness: np.ndarray, subject: str, settings: RenderSe
 
     if subject == "portrait":
         # Oval head guide and face center/feature guides.
-        add(ellipse_points(cx, cy, bw * 0.42, bh * 0.48, 70), "head_oval")
-        add([(cx, y1 + bh * 0.08), (cx + rng.uniform(-5, 5), y2 - bh * 0.04)], "centerline")
-        add([(x1 + bw * 0.22, y1 + bh * 0.42), (x2 - bw * 0.22, y1 + bh * 0.42)], "eye_line")
-        add([(x1 + bw * 0.31, y1 + bh * 0.60), (x2 - bw * 0.31, y1 + bh * 0.60)], "mouth_line")
+        face_box = region_lookup.get("face_outline")
+        left_eye = region_lookup.get("left_eye")
+        right_eye = region_lookup.get("right_eye")
+        mouth = region_lookup.get("mouth")
+        if face_box:
+            fx1, fy1, fx2, fy2 = face_box.bbox
+            fc_x, fc_y = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+            f_bw, f_bh = fx2 - fx1, fy2 - fy1
+            add(ellipse_points(fc_x, fc_y, f_bw * 0.48, f_bh * 0.52, 70), "head_oval", region_name="face_outline")
+            add([(fc_x, fy1 + f_bh * 0.06), (fc_x + rng.uniform(-5, 5), fy2 - f_bh * 0.05)], "centerline", region_name="face_outline")
+        else:
+            add(ellipse_points(cx, cy, bw * 0.42, bh * 0.48, 70), "head_oval", region_name="face_outline")
+            add([(cx, y1 + bh * 0.08), (cx + rng.uniform(-5, 5), y2 - bh * 0.04)], "centerline", region_name="face_outline")
+        if left_eye and right_eye:
+            lx1, ly1, lx2, ly2 = left_eye.bbox
+            rx1, ry1, rx2, ry2 = right_eye.bbox
+            y_eye = ((ly1 + ly2) / 2 + (ry1 + ry2) / 2) / 2
+            add([(lx1, y_eye), (rx2, y_eye)], "eye_line", region_name="left_eye")
+        else:
+            add([(x1 + bw * 0.22, y1 + bh * 0.42), (x2 - bw * 0.22, y1 + bh * 0.42)], "eye_line", region_name="left_eye")
+        if mouth:
+            mx1, my1, mx2, my2 = mouth.bbox
+            y_m = (my1 + my2) / 2
+            add([(mx1, y_m), (mx2, y_m)], "mouth_line", region_name="mouth")
+        else:
+            add([(x1 + bw * 0.31, y1 + bh * 0.60), (x2 - bw * 0.31, y1 + bh * 0.60)], "mouth_line", region_name="mouth")
     elif subject == "architecture":
-        add([(x1, y2), (cx, y1), (x2, y2)], "silhouette")
-        add([(x1, y2), (x2, y2)], "ground")
+        roof = region_lookup.get("roof")
+        entrance = region_lookup.get("entrance")
+        ground = region_lookup.get("ground")
+        if roof:
+            rx1, ry1, rx2, ry2 = roof.bbox
+            add([(rx1, y2), ((rx1 + rx2) / 2, ry1), (rx2, y2)], "silhouette", region_name="roof")
+        else:
+            add([(x1, y2), (cx, y1), (x2, y2)], "silhouette", region_name="roof")
+        if ground:
+            gx1, gy1, gx2, gy2 = ground.bbox
+            add([(gx1, gy1), (gx2, gy1)], "ground", region_name="ground")
+        else:
+            add([(x1, y2), (x2, y2)], "ground", region_name="ground")
+        if entrance:
+            ex1, ey1, ex2, ey2 = entrance.bbox
+            add(rect_points(ex1, ey1, ex2, ey2), "door_frame", opacity=0.13, region_name="entrance")
         for i in range(1, 4):
             x = x1 + bw * i / 4
-            add([(x, y1 + bh * 0.25), (x, y2)], f"vertical_{i}", opacity=0.12)
+            add([(x, y1 + bh * 0.25), (x, y2)], f"vertical_{i}", opacity=0.12, region_name="central_structure")
     else:
-        add(rect_points(x1, y1, x2, y2), "bbox")
-        add([(x1, cy), (x2, cy)], "horizontal")
-        add([(cx, y1), (cx, y2)], "vertical")
+        add(rect_points(x1, y1, x2, y2), "bbox", region_name="overall_subject")
+        add([(x1, cy), (x2, cy)], "horizontal", region_name="overall_subject")
+        add([(cx, y1), (cx, y2)], "vertical", region_name="overall_subject")
     return strokes
 
 
@@ -354,6 +443,68 @@ def extract_contour_strokes(sketch: np.ndarray, darkness: np.ndarray, subject: s
                 f"contour_{idx}_{part_index}", part, layer, region, avg_darkness, settings, rng
             ))
     return strokes
+
+
+def extract_centerline_strokes(sketch: np.ndarray, darkness: np.ndarray, subject: str, settings: RenderSettings, rng: random.Random) -> list[Stroke]:
+    density = settings.stroke_density / 100
+    max_paths = int(250 + settings.max_strokes * (0.62 if getattr(settings, "stroke_extraction_mode", "hybrid") == "centerline" else 0.46))
+    min_len = max(8.0, 18 - density * 9)
+    paths = make_centerline_paths(sketch, darkness, settings.sketch_strength, max_paths=max_paths, min_length=min_len)
+    strokes: list[Stroke] = []
+    for idx, path in enumerate(paths):
+        x, y, x2, y2 = path.bbox
+        bw, bh = max(1, x2 - x), max(1, y2 - y)
+        cx, cy = x + bw / 2, y + bh / 2
+        region = region_from_point(cx, cy, subject, settings.width, settings.height)
+        layer = classify_centerline_layer(path.points, path.length, path.darkness, (x, y, bw, bh), region, subject, settings)
+        chunked = split_long_polyline(path.points, max_segment=90 - 45 * density)
+        for part_index, part in enumerate(chunked):
+            part_len = polyline_length(part)
+            if len(part) < 2 or part_len < min_len * 0.65:
+                continue
+            # Centerlines should feel like a real pencil tip, so use slightly thinner, more confident strokes.
+            thickness = STYLE_DEFAULTS[settings.style_type]["thickness"] * (0.58 + path.darkness * 0.95)
+            opacity = STYLE_DEFAULTS[settings.style_type]["opacity"] * (0.48 + path.darkness * 0.62)
+            strokes.append(build_stroke(
+                f"centerline_{idx}_{part_index}",
+                part,
+                layer,
+                region,
+                path.darkness,
+                settings,
+                rng,
+                thickness_override=thickness,
+                opacity_override=opacity,
+            ))
+    return strokes
+
+
+def classify_centerline_layer(
+    points: list[tuple[float, float]],
+    length: float,
+    darkness: float,
+    rect: tuple[int, int, int, int],
+    region: str,
+    subject: str,
+    settings: RenderSettings,
+) -> str:
+    x, y, bw, bh = rect
+    area_ratio = (bw * bh) / max(1, settings.width * settings.height)
+    if darkness > 0.58 and length < 150:
+        return "accent"
+    if subject == "portrait" and region in {"left_eye", "right_eye", "nose", "mouth"}:
+        return "key"
+    if subject == "architecture" and region in {"entrance", "roof", "central_structure", "left_pillars", "right_pillars"}:
+        return "key" if darkness > 0.18 or length > 42 else "secondary"
+    if subject == "pet" and region in {"left_eye", "right_eye", "nose"}:
+        return "key"
+    if area_ratio > 0.10 or length > min(settings.width, settings.height) * 0.30:
+        return "contour"
+    if length < 30 or max(bw, bh) < 22:
+        return "texture"
+    if darkness > 0.26 and length < 85:
+        return "secondary"
+    return "secondary"
 
 
 def extract_hatching_strokes(darkness: np.ndarray, subject: str, settings: RenderSettings, rng: random.Random) -> list[Stroke]:
@@ -610,6 +761,7 @@ def region_from_point(x: float, y: float, subject: str, width: int, height: int)
 def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
     if subject == "portrait":
         priority = {
+            "overall_subject": -14,
             "face_outline": -8,
             "left_eye": -18,
             "right_eye": -18,
@@ -617,6 +769,7 @@ def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
             "mouth": -7,
             "hair_top": 10,
             "hair_side": 12,
+            "jaw_cheek": 8,
             "neck_clothing": 15,
         }.get(region, 0)
         if layer == "accent" and region in {"left_eye", "right_eye"}:
@@ -624,9 +777,13 @@ def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
         return priority
     if subject == "architecture":
         priority = {
+            "overall_subject": -18,
             "roof": -14,
             "central_structure": -9,
             "entrance": -8,
+            "left_pillars": -4,
+            "right_pillars": -4,
+            "carvings": 10,
             "side_structure": 5,
             "ground": 14,
         }.get(region, 0)
@@ -634,13 +791,13 @@ def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
             priority += 10
         return priority
     if subject == "pet":
-        priority = {"head": -10, "left_eye": -16, "right_eye": -16, "nose": -12, "body_fur": 10}.get(region, 0)
+        priority = {"overall_subject": -12, "head": -10, "left_eye": -16, "right_eye": -16, "nose": -12, "ears": 4, "body_fur": 10}.get(region, 0)
         if layer == "accent" and region in {"left_eye", "right_eye", "nose"}:
             priority += 18
         return priority
     if subject == "logo":
-        return {"logo_core": -12, "logo_outer": 6}.get(region, 0)
-    return {"main_object": -8, "shadow_base": 15, "outer_details": 8}.get(region, 0)
+        return {"logo_core": -12, "logo_outer": 6, "overall_subject": -10}.get(region, 0)
+    return {"overall_subject": -12, "main_object": -8, "detail_core": -3, "shadow_base": 15, "outer_details": 8}.get(region, 0)
 
 
 def apply_artist_order(strokes: list[Stroke], subject: str, settings: RenderSettings, rng: random.Random) -> None:

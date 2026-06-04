@@ -30,8 +30,8 @@ jobs = JobStore()
 
 app = FastAPI(
     title="AI Street Sketch Video Studio Backend",
-    version="0.3.0",
-    description="Photo/sketch to realistic street-artist stroke video renderer with premium hand overlay and job queue.",
+    version="0.5.0",
+    description="Photo/sketch to realistic street-artist stroke video renderer with centerline stroke extraction, semantic region planning, improved hand realism, premium hand overlay, and job queue.",
 )
 
 app.add_middleware(
@@ -57,7 +57,7 @@ def index() -> HTMLResponse:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.5.0",
         "ffmpeg_found": shutil.which("ffmpeg") is not None,
         "tracing": tracer_status(),
         "hand_assets": len(list_hand_assets(ROOT)),
@@ -119,13 +119,15 @@ def run_render_job(job_id: str, image_bytes: bytes, settings: RenderSettings) ->
             "warnings": plan.warnings + list(result.get("warnings", [])),
             "pass_summary": plan.pass_summary,
             "art_director": plan.art_director,
+            "semantic_regions": plan.semantic_regions,
+            "layer_plan": plan.layer_plan,
         }
         jobs.update(job_id, status="done", progress=100, message="Render complete", result=payload)
     except Exception as exc:
         jobs.update(job_id, status="failed", progress=100, message="Render failed", error=str(exc))
 
 
-# This function keeps the endpoint signatures readable while still exposing every Batch 3 setting.
+# This function keeps the endpoint signatures readable while still exposing every premium setting.
 def values_to_settings(
     input_type: str,
     subject_type: str,
@@ -144,6 +146,7 @@ def values_to_settings(
     pencil_audio: bool,
     seed: int,
     trace_mode: str,
+    stroke_extraction_mode: str,
     planning_mode: str,
     art_director_json: str,
     camera_motion: bool,
@@ -176,6 +179,7 @@ def values_to_settings(
         pencil_audio=pencil_audio,
         seed=seed,
         trace_mode=trace_mode,
+        stroke_extraction_mode=stroke_extraction_mode,
         planning_mode=planning_mode,
         art_director_json=art_director_json,
         camera_motion=camera_motion,
@@ -212,6 +216,7 @@ async def analyze(
     pencil_audio: Annotated[bool, Form()] = True,
     seed: Annotated[int, Form()] = 12345,
     trace_mode: Annotated[str, Form()] = "opencv",
+    stroke_extraction_mode: Annotated[str, Form()] = "hybrid",
     planning_mode: Annotated[str, Form()] = "rule",
     art_director_json: Annotated[str, Form()] = "",
     camera_motion: Annotated[bool, Form()] = True,
@@ -230,7 +235,7 @@ async def analyze(
     settings = values_to_settings(
         input_type, subject_type, style_type, ratio, sketch_strength, stroke_density, human_randomness,
         duration_seconds, fps, max_strokes, paper_texture, construction_pass, accent_pass, hand_overlay,
-        pencil_audio, seed, trace_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
+        pencil_audio, seed, trace_mode, stroke_extraction_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
         eraser_pass, title_card_text, watermark_text, hand_mode, hand_scale, hand_opacity, hand_rotation,
         hand_tip_x, hand_tip_y,
     )
@@ -264,6 +269,7 @@ async def render(
     pencil_audio: Annotated[bool, Form()] = True,
     seed: Annotated[int, Form()] = 12345,
     trace_mode: Annotated[str, Form()] = "opencv",
+    stroke_extraction_mode: Annotated[str, Form()] = "hybrid",
     planning_mode: Annotated[str, Form()] = "rule",
     art_director_json: Annotated[str, Form()] = "",
     camera_motion: Annotated[bool, Form()] = True,
@@ -282,7 +288,7 @@ async def render(
     settings = values_to_settings(
         input_type, subject_type, style_type, ratio, sketch_strength, stroke_density, human_randomness,
         duration_seconds, fps, max_strokes, paper_texture, construction_pass, accent_pass, hand_overlay,
-        pencil_audio, seed, trace_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
+        pencil_audio, seed, trace_mode, stroke_extraction_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
         eraser_pass, title_card_text, watermark_text, hand_mode, hand_scale, hand_opacity, hand_rotation,
         hand_tip_x, hand_tip_y,
     )
@@ -306,6 +312,8 @@ async def render(
         "warnings": plan.warnings + list(result.get("warnings", [])),
         "pass_summary": plan.pass_summary,
         "art_director": plan.art_director,
+        "semantic_regions": plan.semantic_regions,
+        "layer_plan": plan.layer_plan,
     })
 
 
@@ -331,6 +339,7 @@ async def render_queued(
     pencil_audio: Annotated[bool, Form()] = True,
     seed: Annotated[int, Form()] = 12345,
     trace_mode: Annotated[str, Form()] = "opencv",
+    stroke_extraction_mode: Annotated[str, Form()] = "hybrid",
     planning_mode: Annotated[str, Form()] = "rule",
     art_director_json: Annotated[str, Form()] = "",
     camera_motion: Annotated[bool, Form()] = True,
@@ -349,7 +358,7 @@ async def render_queued(
     settings = values_to_settings(
         input_type, subject_type, style_type, ratio, sketch_strength, stroke_density, human_randomness,
         duration_seconds, fps, max_strokes, paper_texture, construction_pass, accent_pass, hand_overlay,
-        pencil_audio, seed, trace_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
+        pencil_audio, seed, trace_mode, stroke_extraction_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
         eraser_pass, title_card_text, watermark_text, hand_mode, hand_scale, hand_opacity, hand_rotation,
         hand_tip_x, hand_tip_y,
     )
@@ -394,6 +403,7 @@ async def batch_render(
     pencil_audio: Annotated[bool, Form()] = True,
     seed: Annotated[int, Form()] = 12345,
     trace_mode: Annotated[str, Form()] = "opencv",
+    stroke_extraction_mode: Annotated[str, Form()] = "hybrid",
     planning_mode: Annotated[str, Form()] = "rule",
     art_director_json: Annotated[str, Form()] = "",
     camera_motion: Annotated[bool, Form()] = True,
@@ -410,7 +420,7 @@ async def batch_render(
     settings = values_to_settings(
         input_type, subject_type, style_type, ratio, sketch_strength, stroke_density, human_randomness,
         duration_seconds, fps, max_strokes, paper_texture, construction_pass, accent_pass, hand_overlay,
-        pencil_audio, seed, trace_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
+        pencil_audio, seed, trace_mode, stroke_extraction_mode, planning_mode, art_director_json, camera_motion, smudge_pass,
         eraser_pass, title_card_text, watermark_text, "procedural", 32, 95, -18, 18, 78,
     )
     zip_path = OUTPUT_DIR / f"batch_sketch_videos_{seed}_{int(time.time())}.zip"

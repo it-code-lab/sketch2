@@ -1,118 +1,171 @@
-# AI Street Sketch Video Studio — Batch 3 Premium Upgrade
+# AI Street Sketch Video Studio — Batch 5
 
-This package upgrades Batch 2 into a more premium local app for creating realistic sketching videos from a final image or a final sketch.
+Batch 5 upgrades the Batch 4 semantic-planning app with **true centerline stroke extraction** and **better hand realism**.
 
-The goal is not just to reveal lines. The goal is to simulate a believable professional artist workflow:
+The goal is to make the generated video look less like a simple image reveal and more like a real artist drawing with a pencil/pen tip.
 
-1. loose construction marks
-2. main contour structure
-3. key focal features
-4. secondary details
-5. texture strokes
-6. shading / hatching
-7. smudging / optional eraser highlights
-8. final dark accents
-9. optional hand overlay, audio, title card, watermark, and MP4 export
+---
 
-## What is new in Batch 3
+## What is new in Batch 5
 
-### Real hand overlay support
+### 1. True centerline stroke extraction
 
-Batch 2 had a procedural pencil/hand overlay. Batch 3 adds support for uploading a real transparent PNG/WebP/JPEG hand asset.
+Earlier batches could extract contours around dark sketch shapes. That is useful for outlines, but it can look like the app is tracing around a line rather than drawing the line itself.
 
-Controls included:
-
-- hand mode: procedural, uploaded, or none
-- uploaded hand asset
-- scale
-- opacity
-- rotation
-- tip X/Y anchor percentage
-
-Tip X/Y tells the renderer which point on your hand image should follow the active drawing stroke. For example, if the pencil tip is near the lower-left area of the PNG, try:
+Batch 5 adds a new skeleton/centerline extractor:
 
 ```text
-Tip X: 18
-Tip Y: 78
+sketch image → cleaned binary line art → 1-pixel skeleton → traced centerline paths → human-style stroke segments
 ```
 
-### Render queue and progress
+New file:
 
-Batch 3 adds queued rendering:
-
-- `POST /api/render-queued`
-- `GET /api/jobs/{job_id}`
-- `GET /api/jobs`
-
-The frontend now polls render progress and shows frame/render/encode status.
-
-### Art Director JSON
-
-The app still works with rule-based planning, but you can now provide a planning JSON to influence drawing order.
-
-Example:
-
-```json
-{
-  "subject_type": "portrait",
-  "region_priority": {
-    "left_eye": -22,
-    "right_eye": -22,
-    "nose": -10,
-    "mouth": -7,
-    "hair_top": 12,
-    "neck_clothing": 18
-  },
-  "region_layer_overrides": {
-    "left_eye": "key",
-    "right_eye": "key"
-  }
-}
+```text
+backend/services/centerline_extractor.py
 ```
 
-Lower priority values draw earlier. Higher values draw later.
+Supported stroke extraction modes:
 
-This is designed so a future vision model can act as the “art director,” while your deterministic renderer still creates the final video reliably.
+```text
+Hybrid centerline + contour  Recommended default
+True centerline only          Most pencil-like, best for clean sketches
+Contour fallback only         Useful for difficult/noisy inputs
+```
 
-### SVG tracing hooks
+The new setting is:
 
-The core animation still uses the OpenCV stroke extractor. Batch 3 adds optional SVG sidecar export hooks for:
+```text
+stroke_extraction_mode
+```
 
-- Potrace
-- VTracer
+Allowed values:
 
-If either command-line tool is installed and selected in the UI, the backend can create an SVG sidecar for inspection/future vector-path workflows. If the tool is not installed, the app falls back to OpenCV stroke extraction.
+```text
+hybrid
+centerline
+contour
+```
 
-### More realism effects
+---
 
-Batch 3 adds:
+### 2. Better hand realism
 
-- smudge pass
-- optional eraser/highlight pass
-- subtle camera drift
-- opening title card
-- watermark
-- improved cropped-stroke rendering for better performance
-- render job progress tracking
+The renderer now improves the hand/pen illusion with:
 
-## Run locally
+```text
+smoother hand-tip motion
+stroke-direction-aware hand angle
+hand repositioning between strokes
+small lifted arc during pauses
+contact shadow under pencil tip
+shadow for uploaded hand assets
+less popping between unrelated strokes
+procedural hand/pencil motion improvements
+```
+
+The hand now follows a more believable sequence:
+
+```text
+draw stroke → lift hand → move toward next stroke → lower hand → draw again
+```
+
+---
+
+### 3. Improved planning integration
+
+Batch 5 keeps the Batch 4 semantic planning system and combines it with centerline strokes.
+
+The flow is now:
+
+```text
+Input image
+→ sketch conversion
+→ subject inference
+→ semantic region detection
+→ centerline + contour extraction
+→ semantic stroke reassignment
+→ layer-based artist order
+→ timed rendering
+→ hand overlay + audio + MP4
+```
+
+---
+
+## Project structure
+
+```text
+sketch-video-studio-batch5/
+  backend/
+    main.py
+    models.py
+    services/
+      asset_manager.py
+      audio.py
+      centerline_extractor.py
+      job_store.py
+      render_engine.py
+      semantic_planning.py
+      sketch_pipeline.py
+      svg_tracer.py
+  frontend/
+    index.html
+    styles.css
+    app.js
+  assets/
+  outputs/
+  requirements.txt
+  run_backend.py
+  README.md
+```
+
+---
+
+## Requirements
+
+Install Python 3.10+.
+
+Install FFmpeg and make sure it is available on PATH.
+
+Check FFmpeg:
 
 ```bash
-cd sketch-video-studio-batch3
-python -m venv .venv
+ffmpeg -version
 ```
 
-Windows PowerShell:
+Optional tools:
+
+```text
+Potrace
+VTracer
+```
+
+These are only needed for SVG sidecar tracing. The main Batch 5 centerline renderer does not require them.
+
+---
+
+## Setup on Windows PowerShell
 
 ```powershell
+cd sketch-video-studio-batch5
+python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python run_backend.py
 ```
 
-macOS/Linux:
+Open:
+
+```text
+http://127.0.0.1:8080
+```
+
+---
+
+## Setup on macOS / Linux
 
 ```bash
+cd sketch-video-studio-batch5
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python run_backend.py
@@ -124,136 +177,205 @@ Open:
 http://127.0.0.1:8080
 ```
 
-## FFmpeg requirement
+---
 
-MP4 export requires FFmpeg on PATH.
+## Recommended settings
 
-Check:
+### Clean portrait sketch
+
+```text
+Input type: Already a sketch
+Subject template: Portrait
+Stroke extraction: True centerline only
+Sketch strength: 60–75
+Stroke density: 55–75
+Max strokes: 1800–3500
+Duration: 18–35 seconds
+FPS: 24
+Hand mode: Procedural or uploaded transparent hand PNG
+```
+
+### Photo to street sketch video
+
+```text
+Input type: Photo → sketch
+Subject template: Auto or Portrait
+Stroke extraction: Hybrid centerline + contour
+Sketch strength: 70–85
+Stroke density: 60–80
+Max strokes: 2200–4500
+Duration: 22–45 seconds
+FPS: 24
+Smudge pass: On
+Final accent pass: On
+```
+
+### Temple / architecture sketch
+
+```text
+Input type: Photo → sketch or Already a sketch
+Subject template: Temple / Architecture
+Stroke extraction: Hybrid centerline + contour
+Sketch strength: 70–90
+Stroke density: 65–85
+Max strokes: 3000–6000
+Duration: 25–60 seconds
+Construction pass: On
+Final accent pass: On
+Smudge pass: On
+```
+
+### Fast testing
+
+```text
+Duration: 5–8 seconds
+FPS: 12
+Max strokes: 250–600
+Stroke extraction: Hybrid
+Pencil audio: Off
+```
+
+---
+
+## API endpoints
+
+```text
+GET  /api/health
+POST /api/analyze
+POST /api/render
+POST /api/render-queued
+GET  /api/jobs/{job_id}
+GET  /api/jobs
+POST /api/batch-render
+GET  /api/assets/hand
+```
+
+---
+
+## Key request fields
+
+```text
+input_type: photo | sketch
+subject_type: auto | portrait | architecture | pet | product | landscape | logo
+style_type: pencil | charcoal | ink | marker
+ratio: 9:16 | 1:1 | 16:9
+stroke_extraction_mode: hybrid | centerline | contour
+trace_mode: opencv | auto | potrace | vtracer
+planning_mode: rule | art_director_json
+```
+
+---
+
+## Troubleshooting
+
+### Backend does not start
+
+Run from the project root:
+
+```bash
+python run_backend.py
+```
+
+Make sure dependencies are installed:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### MP4 is not created
+
+Check FFmpeg:
 
 ```bash
 ffmpeg -version
 ```
 
-The app health box will also show whether FFmpeg is detected.
+If FFmpeg is missing, the app can still create frames, preview, and JSON plan, but MP4 export will be skipped.
 
-## Suggested first test settings
+---
 
-For a quick test:
+### Centerline extraction creates too few strokes
+
+Try:
 
 ```text
-Ratio: 9:16
-Duration: 5–8 seconds
+increase Sketch strength
+increase Stroke density
+use Hybrid centerline + contour
+upload a cleaner sketch image
+avoid very low contrast images
+```
+
+---
+
+### Centerline-only mode loses important outlines
+
+Use:
+
+```text
+Stroke extraction: Hybrid centerline + contour
+```
+
+Hybrid mode keeps the natural centerline movement while retaining important large silhouettes.
+
+---
+
+### Hand does not align with uploaded hand image
+
+Adjust:
+
+```text
+Hand scale
+Hand rotation
+Tip X %
+Tip Y %
+```
+
+The transparent hand PNG should have the pencil tip visible. Use Tip X and Tip Y to tell the app where the pencil tip is inside the uploaded hand image.
+
+---
+
+### Rendering is slow
+
+Use lower settings while testing:
+
+```text
 FPS: 12
-Max strokes: 250–700
-Hand mode: none or procedural
-Pencil audio: off for first test
+Duration: 5–8 seconds
+Max strokes: 500–1000
+Ratio: 1:1
+Pencil audio: Off
 ```
 
-For a better social video:
+Use higher settings only for final exports.
+
+---
+
+## Validation performed
+
+The Batch 5 backend files were compiled successfully with Python.
+
+A small test render was also executed successfully with:
 
 ```text
-Ratio: 9:16
-Duration: 18–35 seconds
-FPS: 24
-Max strokes: 1200–3000
-Hand mode: uploaded or procedural
-Pencil audio: on
-Smudge pass: on
-Final accent pass: on
+hybrid centerline extraction
+hand overlay enabled
+MP4 output generated
 ```
 
-## Output resolution
+---
 
-Batch 3 defaults are optimized for local rendering speed:
+## Recommended next upgrades
+
+The next highest-impact professional upgrades are:
 
 ```text
-9:16  -> 540 x 960
-1:1   -> 720 x 720
-16:9  -> 960 x 540
+1. real transparent hand video overlay, not just static PNG
+2. pencil-tip calibration UI with live draggable anchor
+3. stroke merge/simplification quality controls
+4. subject-specific AI art director using a vision model
+5. final 1080p/4K export profiles
+6. automatic side-by-side before/after and social-media templates
 ```
-
-You can increase these in `backend/models.py` inside `ratio_to_size()` after the renderer and queue are stable on your machine.
-
-## API overview
-
-### Health
-
-```http
-GET /api/health
-```
-
-Returns FFmpeg and tracer availability.
-
-### Analyze
-
-```http
-POST /api/analyze
-```
-
-Returns:
-
-- source preview
-- sketch preview
-- full stroke plan JSON
-- pass summary
-- warnings
-
-### Render immediately
-
-```http
-POST /api/render
-```
-
-Renders in the request and returns MP4/plan/preview links.
-
-### Render with queue
-
-```http
-POST /api/render-queued
-```
-
-Returns a job id.
-
-Then poll:
-
-```http
-GET /api/jobs/{job_id}
-```
-
-## File structure
-
-```text
-backend/
-  main.py
-  models.py
-  services/
-    asset_manager.py
-    audio.py
-    job_store.py
-    render_engine.py
-    sketch_pipeline.py
-    svg_tracer.py
-frontend/
-  index.html
-  styles.css
-  app.js
-assets/
-  .gitkeep
-outputs/
-  .gitkeep
-requirements.txt
-run_backend.py
-```
-
-## Notes for future Batch 4
-
-Recommended next upgrades:
-
-1. true SVG path parsing into stroke paths
-2. object/face-part detection for better automatic region planning
-3. real brush/pencil sound library instead of procedural audio
-4. GPU-accelerated preview rendering
-5. 1080p/4K final render profile
-6. multiple hand assets and hand pose library
-7. background music and final reveal template
-8. reusable preset templates for portrait, temple, pet, product, and logo videos
