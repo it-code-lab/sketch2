@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from typing import Any
+
+HAND_PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "pencil_right_topdown",
+        "name": "Pencil · Right Hand · Top Down",
+        "style_type": "pencil",
+        "hand_side": "right",
+        "hand_mode": "video",
+        "camera_angle": "topdown",
+        "hand_scale": 34,
+        "hand_opacity": 96,
+        "hand_rotation": -20,
+        "hand_tip_x": 18,
+        "hand_tip_y": 78,
+        "hand_video_loop": True,
+        "hand_video_playback_rate": 100,
+        "hand_video_frame_offset": 0,
+        "hand_video_chroma_key": False,
+        "hand_lift_px": 14,
+        "hand_shadow_strength": 72,
+        "notes": "Balanced default for most portrait and object sketches.",
+    },
+    {
+        "id": "charcoal_right_angle",
+        "name": "Charcoal · Right Hand · Angled",
+        "style_type": "charcoal",
+        "hand_side": "right",
+        "hand_mode": "video",
+        "camera_angle": "angled",
+        "hand_scale": 42,
+        "hand_opacity": 92,
+        "hand_rotation": -28,
+        "hand_tip_x": 22,
+        "hand_tip_y": 74,
+        "hand_video_loop": True,
+        "hand_video_playback_rate": 92,
+        "hand_video_frame_offset": 0,
+        "hand_video_chroma_key": False,
+        "hand_lift_px": 18,
+        "hand_shadow_strength": 84,
+        "notes": "Heavier hand presence with more contact shadow for charcoal look.",
+    },
+    {
+        "id": "ink_right_topdown",
+        "name": "Ink Pen · Right Hand · Top Down",
+        "style_type": "ink",
+        "hand_side": "right",
+        "hand_mode": "video",
+        "camera_angle": "topdown",
+        "hand_scale": 30,
+        "hand_opacity": 98,
+        "hand_rotation": -14,
+        "hand_tip_x": 16,
+        "hand_tip_y": 81,
+        "hand_video_loop": True,
+        "hand_video_playback_rate": 104,
+        "hand_video_frame_offset": 0,
+        "hand_video_chroma_key": False,
+        "hand_lift_px": 10,
+        "hand_shadow_strength": 58,
+        "notes": "Tighter tip anchor and lighter shadow for ink or marker videos.",
+    },
+    {
+        "id": "marker_left_topdown",
+        "name": "Marker · Left Hand · Top Down",
+        "style_type": "marker",
+        "hand_side": "left",
+        "hand_mode": "video",
+        "camera_angle": "topdown",
+        "hand_scale": 36,
+        "hand_opacity": 95,
+        "hand_rotation": 16,
+        "hand_tip_x": 82,
+        "hand_tip_y": 78,
+        "hand_video_loop": True,
+        "hand_video_playback_rate": 100,
+        "hand_video_frame_offset": 0,
+        "hand_video_chroma_key": False,
+        "hand_lift_px": 12,
+        "hand_shadow_strength": 64,
+        "notes": "Left-handed preset with mirrored tip position.",
+    },
+    {
+        "id": "procedural_quick_preview",
+        "name": "Procedural Quick Preview",
+        "style_type": "pencil",
+        "hand_side": "right",
+        "hand_mode": "procedural",
+        "camera_angle": "topdown",
+        "hand_scale": 30,
+        "hand_opacity": 88,
+        "hand_rotation": -18,
+        "hand_tip_x": 18,
+        "hand_tip_y": 78,
+        "hand_video_loop": True,
+        "hand_video_playback_rate": 100,
+        "hand_video_frame_offset": 0,
+        "hand_video_chroma_key": False,
+        "hand_lift_px": 10,
+        "hand_shadow_strength": 50,
+        "notes": "Fallback preset when no real hand asset is ready yet.",
+    },
+]
+
+
+def list_hand_presets() -> list[dict[str, Any]]:
+    return HAND_PRESETS
+
+
+def get_hand_preset(preset_id: str) -> dict[str, Any] | None:
+    for preset in HAND_PRESETS:
+        if preset["id"] == preset_id:
+            return preset
+    return None

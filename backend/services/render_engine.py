@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 import math
 import os
 import random
@@ -15,7 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 from backend.models import RenderSettings, Stroke, StrokePlan
-from backend.services.audio import generate_pencil_audio
+from backend.services.audio import generate_layered_audio
 
 STYLE_COLORS = {
     "pencil": (34, 32, 29),
@@ -25,6 +26,101 @@ STYLE_COLORS = {
 }
 
 PAPER_BASE = (242, 235, 219)
+
+
+def quality_encode_options(settings: RenderSettings) -> tuple[str, str]:
+    quality = getattr(settings, "render_quality", "standard")
+    if quality == "preview":
+        return "24", "veryfast"
+    if quality == "final":
+        return "18", "slow"
+    if quality == "ultra":
+        return "16", "slow"
+    return "20", "medium"
+
+
+@dataclass
+class HandVideoOverlay:
+    frame_paths: list[Path]
+    warnings: list[str] = field(default_factory=list)
+    cache: dict[int, Image.Image] = field(default_factory=dict)
+
+    def frame(self, frame_idx: int, settings: RenderSettings) -> Image.Image | None:
+        if not self.frame_paths:
+            return None
+        rate = max(25, min(400, int(getattr(settings, "hand_video_playback_rate", 100)))) / 100.0
+        offset = int(getattr(settings, "hand_video_frame_offset", 0))
+        raw_index = int(frame_idx * rate) + offset
+        if getattr(settings, "hand_video_loop", True):
+            idx = raw_index % len(self.frame_paths)
+        else:
+            idx = max(0, min(len(self.frame_paths) - 1, raw_index))
+        if idx not in self.cache:
+            try:
+                frame = Image.open(self.frame_paths[idx]).convert("RGBA")
+                if getattr(settings, "hand_video_chroma_key", False):
+                    frame = apply_green_chroma_key(frame)
+                self.cache[idx] = frame
+                # Keep memory bounded during long renders. Sequential access means
+                # dropping older decoded frames is usually fine.
+                if len(self.cache) > 96:
+                    for key in sorted(self.cache.keys())[:32]:
+                        self.cache.pop(key, None)
+            except Exception:
+                return None
+        return self.cache[idx]
+
+
+def prepare_hand_video_overlay(settings: RenderSettings, output_dir: Path, job_id: str, total_frames: int) -> HandVideoOverlay | None:
+    if getattr(settings, "hand_mode", "procedural") != "video":
+        return None
+    asset_path = Path(getattr(settings, "hand_asset_path", ""))
+    if not asset_path.exists():
+        return HandVideoOverlay([], ["Hand video mode selected, but no video asset was uploaded."])
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return HandVideoOverlay([], ["FFmpeg is required to extract transparent hand video frames."])
+
+    cache_dir = output_dir / f"{job_id}_hand_video_frames"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Extract at render FPS. Transparent WebM/MOV assets keep their alpha when
+    # decoded into RGBA PNG frames. MP4 normally has no alpha, but is still usable
+    # as a regular opaque overlay or with optional green-screen keying.
+    cmd = [
+        ffmpeg, "-y", "-i", str(asset_path),
+        "-vf", f"fps={settings.fps}",
+        "-frames:v", str(max(1, min(total_frames * 2, 6000))),
+        "-pix_fmt", "rgba",
+        str(cache_dir / "hand_%05d.png"),
+    ]
+    warnings: list[str] = []
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=max(40, int(settings.duration_seconds * 4)))
+        if proc.returncode != 0:
+            warnings.append("FFmpeg could not extract hand video frames; falling back to procedural hand overlay.")
+            warnings.append(proc.stderr[-1200:])
+    except subprocess.TimeoutExpired as exc:
+        warnings.append("Timed out while extracting hand video frames; falling back to procedural hand overlay.")
+        warnings.append(str(exc)[-600:])
+
+    frame_paths = sorted(cache_dir.glob("hand_*.png"))
+    if not frame_paths:
+        warnings.append("No hand video frames were extracted. Check that the file is a valid WebM/MP4/MOV/MKV video.")
+    return HandVideoOverlay(frame_paths, warnings)
+
+
+def apply_green_chroma_key(frame: Image.Image) -> Image.Image:
+    arr = np.array(frame.convert("RGBA"))
+    r = arr[..., 0].astype(np.int16)
+    g = arr[..., 1].astype(np.int16)
+    b = arr[..., 2].astype(np.int16)
+    # Conservative green screen removal: strong green and clearly above red/blue.
+    mask = (g > 95) & (g > r * 1.25) & (g > b * 1.25)
+    softness = np.clip((g - np.maximum(r, b) - 18) * 5, 0, 255).astype(np.uint8)
+    alpha = arr[..., 3]
+    alpha[mask] = np.minimum(alpha[mask], 255 - softness[mask])
+    arr[..., 3] = alpha
+    return Image.fromarray(arr, "RGBA")
 
 
 def render_plan_to_mp4(
@@ -49,23 +145,40 @@ def render_plan_to_mp4(
     mp4_path = output_dir / f"{job_id}.mp4"
     plan_path = output_dir / f"{job_id}_plan.json"
     preview_path = output_dir / f"{job_id}_sketch.png"
-    audio_path = output_dir / f"{job_id}_scratch.wav"
+    audio_path = output_dir / f"{job_id}_audio.wav"
 
     duration = settings.duration_seconds
     fps = settings.fps
     total_frames = max(1, int(duration * fps))
 
-    background = create_paper_background(settings.width, settings.height, settings.paper_texture, settings.seed)
-    render_frames(plan.strokes, background, settings, frames_dir, total_frames, progress_callback=progress)
+    warnings: list[str] = []
+    hand_video_overlay = None
+    if getattr(settings, "hand_mode", "procedural") == "video":
+        progress(5, "Extracting transparent hand video frames")
+        hand_video_overlay = prepare_hand_video_overlay(settings, output_dir, job_id, total_frames)
+        if hand_video_overlay:
+            warnings.extend(hand_video_overlay.warnings)
+
+    background = create_paper_background(settings.width, settings.height, settings.paper_texture, settings.seed, settings)
+    render_frames(plan.strokes, background, settings, frames_dir, total_frames, progress_callback=progress, hand_video_overlay=hand_video_overlay)
 
     progress(82, "Saving preview and stroke plan")
     sketch_preview.save(preview_path)
     plan_path.write_text(json.dumps(plan.to_dict(include_strokes=True), indent=2), encoding="utf-8")
 
-    warnings: list[str] = []
     if settings.pencil_audio:
-        progress(84, "Generating pencil scratch audio")
-        generate_pencil_audio(audio_path, duration, settings.seed)
+        progress(84, "Generating layered drawing audio")
+        generate_layered_audio(
+            audio_path,
+            duration,
+            seed=settings.seed,
+            style_type=getattr(settings, "style_type", "pencil"),
+            ambient_track=getattr(settings, "ambient_track", "none"),
+            ambient_level=getattr(settings, "ambient_level", 18),
+            drawing_level=getattr(settings, "drawing_audio_level", 70),
+            transition_sfx=False,
+            transition_sfx_level=getattr(settings, "transition_sfx_level", 30),
+        )
     progress(88, "Encoding MP4 with FFmpeg")
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -76,6 +189,7 @@ def render_plan_to_mp4(
             "frames_dir": str(frames_dir),
             "plan": str(plan_path),
             "preview": str(preview_path),
+            "audio": str(audio_path) if audio_path.exists() else "",
             "frame_count": total_frames,
             "duration_seconds": duration,
             "warnings": warnings,
@@ -91,17 +205,20 @@ def render_plan_to_mp4(
     ]
     if settings.pencil_audio and audio_path.exists():
         cmd += ["-i", str(audio_path), "-shortest"]
+    crf, preset = quality_encode_options(settings)
     cmd += [
         "-frames:v",
         str(total_frames),
         "-c:v",
         "libx264",
+        "-preset",
+        preset,
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
         "-crf",
-        "20",
+        crf,
         str(mp4_path),
     ]
 
@@ -133,13 +250,14 @@ def render_plan_to_mp4(
         "frames_dir": str(frames_dir) if frames_dir.exists() else "",
         "plan": str(plan_path),
         "preview": str(preview_path),
+        "audio": str(audio_path) if audio_path.exists() else "",
         "frame_count": total_frames,
         "duration_seconds": duration,
         "warnings": warnings,
     }
 
 
-def render_frames(strokes: list[Stroke], background: Image.Image, settings: RenderSettings, frames_dir: Path, total_frames: int, progress_callback: Callable[[float, str], None] | None = None) -> None:
+def render_frames(strokes: list[Stroke], background: Image.Image, settings: RenderSettings, frames_dir: Path, total_frames: int, progress_callback: Callable[[float, str], None] | None = None, hand_video_overlay: HandVideoOverlay | None = None) -> None:
     frames_dir.mkdir(parents=True, exist_ok=True)
     duration_ms = settings.duration_seconds * 1000
     # Drawing all strokes from scratch per frame is expensive, so cache completed strokes onto a base image.
@@ -164,26 +282,31 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
             stroke = strokes[idx]
             if stroke.start_ms <= t <= stroke.end_ms:
                 progress = (t - stroke.start_ms) / max(1, stroke.duration_ms)
-                tip, heading = partial_tip_and_heading(stroke.points, progress)
-                active_state = {"tip": tip, "heading": heading, "contact": True, "lift": 0.0}
+                tip, heading = contact_tip_and_heading(stroke.points, progress, settings)
+                active_state = {"tip": tip, "heading": heading, "contact": True, "lift": 0.0, "progress": progress}
                 draw_stroke(frame, stroke, settings, progress=progress)
             elif stroke.start_ms > t:
                 break
 
         if active_state is None:
-            active_state = reposition_hand_state(strokes, last_completed_index, t)
+            active_state = reposition_hand_state(strokes, last_completed_index, t, settings)
 
         if settings.hand_overlay and active_state is not None:
             desired_tip = active_state["tip"]  # type: ignore[assignment]
             desired_angle = float(active_state.get("heading", 0.0))
+            contact_amount = bool(active_state.get("contact", True))
+            contact_smoothing = smoothing_amount(settings, contact=contact_amount)
+            angle_smoothing = angle_smoothing_amount(settings, contact=contact_amount)
             if hand_tip_smoothed is None:
                 hand_tip_smoothed = desired_tip  # type: ignore[assignment]
             else:
-                hand_tip_smoothed = smooth_point(hand_tip_smoothed, desired_tip, 0.38 if active_state.get("contact") else 0.22)  # type: ignore[arg-type]
+                hand_tip_smoothed = smooth_point(hand_tip_smoothed, desired_tip, contact_smoothing)  # type: ignore[arg-type]
+                if contact_amount:
+                    hand_tip_smoothed = apply_contact_correction(hand_tip_smoothed, desired_tip, settings)
             if hand_angle_smoothed is None:
                 hand_angle_smoothed = desired_angle
             else:
-                hand_angle_smoothed = smooth_angle(hand_angle_smoothed, desired_angle, 0.22)
+                hand_angle_smoothed = smooth_angle(hand_angle_smoothed, desired_angle, angle_smoothing)
             draw_hand_overlay(
                 frame,
                 hand_tip_smoothed,
@@ -192,14 +315,49 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
                 heading=hand_angle_smoothed,
                 contact=bool(active_state.get("contact", True)),
                 lift=float(active_state.get("lift", 0.0)),
+                hand_video_overlay=hand_video_overlay,
             )
 
+        apply_frame_motion_blur(frame, settings, frame_idx, total_frames)
         apply_camera_motion_and_labels(frame, settings, frame_idx, total_frames)
         frame.convert("RGB").save(frames_dir / f"frame_{frame_idx:05d}.png", optimize=False)
 
 
 
-def reposition_hand_state(strokes: list[Stroke], last_completed_index: int, t: float) -> dict[str, object] | None:
+def smoothing_amount(settings: RenderSettings, contact: bool = True) -> float:
+    base = max(0.0, min(100.0, float(getattr(settings, "contact_position_smoothing", 58)))) / 100.0
+    if contact:
+        # More smoothing slider means less snap. Keep contact fairly responsive.
+        return max(0.18, min(0.72, 0.78 - base * 0.46))
+    return max(0.10, min(0.48, 0.52 - base * 0.24))
+
+
+def angle_smoothing_amount(settings: RenderSettings, contact: bool = True) -> float:
+    base = max(0.0, min(100.0, float(getattr(settings, "contact_position_smoothing", 58)))) / 100.0
+    return max(0.10, min(0.52, (0.28 if contact else 0.18) + (0.22 - base * 0.10)))
+
+
+def apply_contact_correction(current: tuple[float, float], desired: tuple[float, float], settings: RenderSettings) -> tuple[float, float]:
+    strength = max(0.0, min(100.0, float(getattr(settings, "contact_correction_strength", 72)))) / 100.0
+    blend = 0.16 + strength * 0.52
+    return (current[0] + (desired[0] - current[0]) * blend, current[1] + (desired[1] - current[1]) * blend)
+
+
+def contact_tip_and_heading(points: list[tuple[float, float]], progress: float, settings: RenderSettings) -> tuple[tuple[float, float], float]:
+    tip, heading = partial_tip_and_heading(points, progress)
+    # Look slightly ahead and behind to stabilize orientation and produce better hand-stroke contact.
+    look = 0.02 + max(0.0, min(100.0, float(getattr(settings, "contact_correction_strength", 72)))) / 100.0 * 0.06
+    prev_tip = partial_tip(points, max(0.0, progress - look))
+    next_tip = partial_tip(points, min(1.0, progress + look))
+    dx = next_tip[0] - prev_tip[0]
+    dy = next_tip[1] - prev_tip[1]
+    if abs(dx) > 1e-5 or abs(dy) > 1e-5:
+        heading = math.atan2(dy, dx)
+    return tip, heading
+
+
+
+def reposition_hand_state(strokes: list[Stroke], last_completed_index: int, t: float, settings: RenderSettings) -> dict[str, object] | None:
     """Move the hand between strokes instead of popping it off-screen.
 
     During pauses, the hand follows a small lifted arc from the previous stroke end
@@ -233,7 +391,8 @@ def reposition_hand_state(strokes: list[Stroke], last_completed_index: int, t: f
     eased = ease_in_out(u)
     a = previous.points[-1]
     b = next_stroke.points[0]
-    arc_height = min(42.0, 10.0 + distance(a, b) * 0.10)
+    arc_scale = max(0.25, min(1.65, getattr(settings, "reposition_arc_strength", 55) / 55.0))
+    arc_height = min(58.0, (10.0 + distance(a, b) * 0.10) * arc_scale)
     x = a[0] + (b[0] - a[0]) * eased
     y = a[1] + (b[1] - a[1]) * eased - math.sin(math.pi * eased) * arc_height
     heading = interpolate_angle(stroke_final_heading(previous), stroke_initial_heading(next_stroke), eased)
@@ -277,11 +436,87 @@ def stroke_final_heading(stroke: Stroke) -> float:
     return math.atan2(b[1] - a[1], b[0] - a[0])
 
 
+def resolve_camera_move(settings: RenderSettings) -> tuple[float, float, float, float, float, float]:
+    preset = getattr(settings, "camera_move_preset", "static") or "static"
+    zs = float(getattr(settings, "camera_zoom_start", 100))
+    ze = float(getattr(settings, "camera_zoom_end", 100))
+    psx = float(getattr(settings, "camera_pan_start_x", 0))
+    psy = float(getattr(settings, "camera_pan_start_y", 0))
+    pex = float(getattr(settings, "camera_pan_end_x", 0))
+    pey = float(getattr(settings, "camera_pan_end_y", 0))
+    if preset == "zoom_in":
+        zs, ze = 100, max(110, ze if ze != 100 else 120)
+    elif preset == "zoom_out":
+        zs, ze = max(110, zs if zs != 100 else 120), 100
+    elif preset == "pan_left_to_right":
+        psx, pex = -55, 55
+    elif preset == "pan_right_to_left":
+        psx, pex = 55, -55
+    elif preset == "pan_top_to_bottom":
+        psy, pey = -55, 55
+    elif preset == "pan_bottom_to_top":
+        psy, pey = 55, -55
+    elif preset == "ken_burns":
+        zs, ze = 108, 126
+        psx, psy, pex, pey = -18, -10, 18, 12
+    elif preset == "push_in_left":
+        zs, ze = 104, 124
+        psx, pex = -40, -8
+    elif preset == "push_in_right":
+        zs, ze = 104, 124
+        psx, pex = 40, 8
+    return zs, ze, psx, psy, pex, pey
+
+
+def apply_scene_camera_transform(frame: Image.Image, settings: RenderSettings, frame_idx: int, total_frames: int) -> None:
+    preset = getattr(settings, "camera_move_preset", "static") or "static"
+    if preset == "static" and all(int(getattr(settings, k, 0)) == default for k, default in [("camera_zoom_start",100),("camera_zoom_end",100),("camera_pan_start_x",0),("camera_pan_start_y",0),("camera_pan_end_x",0),("camera_pan_end_y",0)]):
+        return
+    t = 0.0 if total_frames <= 1 else frame_idx / max(1, total_frames - 1)
+    zs, ze, psx, psy, pex, pey = resolve_camera_move(settings)
+    zoom = max(1.0, (zs + (ze - zs) * t) / 100.0)
+    src = frame.copy()
+    crop_w = max(8, int(round(src.width / zoom)))
+    crop_h = max(8, int(round(src.height / zoom)))
+    max_dx = max(0.0, (src.width - crop_w) / 2.0)
+    max_dy = max(0.0, (src.height - crop_h) / 2.0)
+    pan_x = (psx + (pex - psx) * t) / 100.0
+    pan_y = (psy + (pey - psy) * t) / 100.0
+    cx = src.width / 2.0 + max_dx * pan_x
+    cy = src.height / 2.0 + max_dy * pan_y
+    left = int(round(max(0, min(src.width - crop_w, cx - crop_w / 2.0))))
+    top = int(round(max(0, min(src.height - crop_h, cy - crop_h / 2.0))))
+    cropped = src.crop((left, top, left + crop_w, top + crop_h)).resize(src.size, Image.LANCZOS)
+    frame.paste(cropped)
+
+
+def apply_frame_motion_blur(frame: Image.Image, settings: RenderSettings, frame_idx: int, total_frames: int) -> None:
+    strength = max(0, min(100, int(getattr(settings, "motion_blur_strength", 14))))
+    if strength <= 0:
+        return
+    quality = getattr(settings, "render_quality", "standard")
+    if quality == "preview" and strength < 18:
+        return
+    radius = 1 if strength < 40 else 2
+    alpha = 0.06 + strength / 220.0
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    dx = int(round(math.sin(frame_idx * 0.21) * radius))
+    dy = int(round(math.cos(frame_idx * 0.17) * radius))
+    if dx == 0 and dy == 0:
+        dx = 1
+    overlay.alpha_composite(frame, (dx, dy))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=0.6 + strength / 95.0))
+    frame.alpha_composite(overlay, (0, 0))
+
+
 def apply_camera_motion_and_labels(frame: Image.Image, settings: RenderSettings, frame_idx: int, total_frames: int) -> None:
+    apply_scene_camera_transform(frame, settings, frame_idx, total_frames)
     # Subtle handheld camera drift. It is intentionally tiny so stroke coordinates remain accurate.
     if getattr(settings, "camera_motion", False):
-        drift_x = int(math.sin(frame_idx * 0.013) * 2)
-        drift_y = int(math.cos(frame_idx * 0.011) * 2)
+        move_preset = getattr(settings, "camera_move_preset", "static") or "static"
+        drift_amt = 1 if move_preset == "static" else 2
+        drift_x = int(math.sin(frame_idx * 0.013) * drift_amt)
+        drift_y = int(math.cos(frame_idx * 0.011) * drift_amt)
         if drift_x or drift_y:
             shifted = Image.new("RGBA", frame.size, PAPER_BASE + (255,))
             shifted.alpha_composite(frame, (drift_x, drift_y))
@@ -297,12 +532,13 @@ def apply_camera_motion_and_labels(frame: Image.Image, settings: RenderSettings,
         text = settings.watermark_text
         draw.text((frame.width - 24 - len(text) * 7, frame.height - 38), text, fill=(40, 35, 29, 95))
 
-def create_paper_background(width: int, height: int, texture: bool, seed: int) -> Image.Image:
+def create_paper_background(width: int, height: int, texture: bool, seed: int, settings: RenderSettings | None = None) -> Image.Image:
     base = Image.new("RGBA", (width, height), PAPER_BASE + (255,))
     if not texture:
         return base
     rng = np.random.default_rng(seed)
-    noise = rng.normal(0, 7, (height, width)).clip(-22, 22).astype(np.int16)
+    noise_sigma = 6 if not settings else {"preview": 5, "standard": 6, "final": 7, "ultra": 8}.get(getattr(settings, "render_quality", "standard"), 6)
+    noise = rng.normal(0, noise_sigma, (height, width)).clip(-24, 24).astype(np.int16)
     arr = np.zeros((height, width, 4), dtype=np.uint8)
     arr[..., 0] = np.clip(PAPER_BASE[0] + noise, 0, 255)
     arr[..., 1] = np.clip(PAPER_BASE[1] + noise, 0, 255)
@@ -311,7 +547,8 @@ def create_paper_background(width: int, height: int, texture: bool, seed: int) -
     paper = Image.fromarray(arr, "RGBA").filter(ImageFilter.GaussianBlur(radius=0.35))
     draw = ImageDraw.Draw(paper, "RGBA")
     random.seed(seed)
-    for _ in range(max(120, int(width * height / 6500))):
+    density_factor = {"preview": 0.7, "standard": 1.0, "final": 1.25, "ultra": 1.5}.get(getattr(settings, "render_quality", "standard") if settings else "standard", 1.0)
+    for _ in range(max(120, int(width * height / 6500 * density_factor))):
         x = random.randint(0, width)
         y = random.randint(0, height)
         length = random.randint(8, 80)
@@ -358,26 +595,86 @@ def draw_stroke(image: Image.Image, stroke: Stroke, settings: RenderSettings, pr
     color_base = STYLE_COLORS.get(settings.style_type, STYLE_COLORS["pencil"])
     alpha = int(255 * stroke.opacity)
     width = max(1, int(round(stroke.thickness)))
+    taper_strength = max(0.0, min(1.0, getattr(settings, "stroke_taper", 58) / 100.0))
 
     if settings.style_type == "charcoal":
-        # Soft body plus dark center.
-        draw_textured_line(draw, local_points, color_base + (int(alpha * 0.42),), width + 5, stroke.jitter * 1.4, rng)
-        layer = layer.filter(ImageFilter.GaussianBlur(radius=0.55 + stroke.thickness * 0.08))
+        # Soft body plus dark center and dust.
+        draw_variable_width_line(draw, local_points, color_base + (int(alpha * 0.34),), width + 6, stroke.jitter * 1.5, rng, taper_strength * 0.35)
+        sprinkle_texture(draw, local_points, color_base, int(alpha * 0.18), getattr(settings, "charcoal_dust", 55), rng, radius=8)
+        layer = layer.filter(ImageFilter.GaussianBlur(radius=0.7 + stroke.thickness * 0.10 + getattr(settings, "charcoal_dust", 55) / 220))
         draw = ImageDraw.Draw(layer, "RGBA")
-        draw_textured_line(draw, local_points, color_base + (alpha,), width + 1, stroke.jitter, rng)
+        draw_variable_width_line(draw, local_points, color_base + (alpha,), width + 1, stroke.jitter, rng, taper_strength)
     elif settings.style_type == "marker":
-        draw.line(local_points, fill=color_base + (int(alpha * 0.72),), width=width + 3, joint="curve")
-        draw.line(local_points, fill=color_base + (alpha,), width=max(1, width), joint="curve")
+        overlap = max(0.0, min(1.0, getattr(settings, "marker_overlap", 42) / 100.0))
+        draw_variable_width_line(draw, local_points, color_base + (int(alpha * (0.50 + overlap * 0.18)),), width + 3, stroke.jitter * 0.55, rng, taper_strength * 0.18)
+        for offset in [(-1.0, 0.5), (1.2, -0.4)]:
+            shifted = [(x + offset[0], y + offset[1]) for x, y in local_points]
+            draw_variable_width_line(draw, shifted, color_base + (int(alpha * (0.28 + overlap * 0.12)),), max(1, width), stroke.jitter * 0.35, rng, taper_strength * 0.12)
+        draw_variable_width_line(draw, local_points, color_base + (alpha,), max(1, width), stroke.jitter * 0.25, rng, taper_strength * 0.15)
     elif settings.style_type == "ink":
-        draw.line(local_points, fill=color_base + (alpha,), width=width, joint="curve")
+        draw_variable_width_line(draw, local_points, color_base + (alpha,), width, stroke.jitter * 0.18, rng, taper_strength)
+        bleed = getattr(settings, "ink_bleed", 28)
+        if bleed > 0:
+            bleed_layer = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+            bleed_draw = ImageDraw.Draw(bleed_layer, "RGBA")
+            draw_variable_width_line(bleed_draw, local_points, color_base + (int(alpha * 0.22),), width + 2, stroke.jitter * 0.16, rng, taper_strength * 0.55)
+            bleed_layer = bleed_layer.filter(ImageFilter.GaussianBlur(radius=0.4 + bleed / 45.0))
+            layer.alpha_composite(bleed_layer)
     else:
-        draw_textured_line(draw, local_points, color_base + (alpha,), width, stroke.jitter, rng)
-        # Light duplicate scratch lines create pencil grain.
+        draw_variable_width_line(draw, local_points, color_base + (alpha,), width, stroke.jitter, rng, taper_strength)
+        graphite = getattr(settings, "graphite_grain", 65)
+        add_graphite_grain(draw, local_points, color_base, int(alpha * 0.22), graphite, rng)
         if stroke.layer in {"shading", "texture", "layout"}:
-            for _ in range(1):
-                draw_textured_line(draw, local_points, color_base + (int(alpha * 0.28),), max(1, width - 1), stroke.jitter + 0.9, rng)
+            draw_variable_width_line(draw, local_points, color_base + (int(alpha * 0.26),), max(1, width - 1), stroke.jitter + 0.9, rng, taper_strength * 0.55)
 
     image.alpha_composite(layer, (x0, y0))
+
+
+def tapered_factor(u: float, strength: float) -> float:
+    # 1 at center, lower at the ends.
+    if strength <= 0.0:
+        return 1.0
+    edge = abs(u - 0.5) * 2.0
+    return max(0.28, 1.0 - edge * strength * 0.85)
+
+
+def draw_variable_width_line(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], fill: tuple[int, int, int, int], width: int, jitter: float, rng: random.Random, taper_strength: float = 0.0) -> None:
+    if len(points) < 2:
+        return
+    total_segments = max(1, len(points) - 1)
+    jittered = [(x + rng.uniform(-jitter, jitter), y + rng.uniform(-jitter, jitter)) for x, y in points]
+    for idx, (a, b) in enumerate(zip(jittered, jittered[1:])):
+        u = idx / max(1, total_segments - 1)
+        seg_width = max(1, int(round(width * tapered_factor(u, taper_strength))))
+        draw.line([a, b], fill=fill, width=seg_width, joint="curve")
+
+
+def sprinkle_texture(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], color_base: tuple[int, int, int], alpha: int, amount: int, rng: random.Random, radius: int = 6) -> None:
+    density = max(0, min(100, amount))
+    if density <= 0 or len(points) < 2:
+        return
+    step = max(2, 7 - density // 18)
+    for idx, (x, y) in enumerate(points[::step]):
+        count = 1 + density // 28
+        for _ in range(count):
+            dx = rng.uniform(-radius, radius)
+            dy = rng.uniform(-radius * 0.7, radius * 0.7)
+            r = max(1, 1 + density // 40)
+            a = max(8, min(255, alpha + rng.randint(-14, 14)))
+            draw.ellipse((x + dx - r, y + dy - r, x + dx + r, y + dy + r), fill=color_base + (a,))
+
+
+def add_graphite_grain(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], color_base: tuple[int, int, int], alpha: int, amount: int, rng: random.Random) -> None:
+    density = max(0, min(100, amount))
+    if density <= 0:
+        return
+    step = max(2, 9 - density // 14)
+    for x, y in points[::step]:
+        for _ in range(1 + density // 35):
+            dx = rng.uniform(-3.0, 3.0)
+            dy = rng.uniform(-2.0, 2.0)
+            a = max(8, min(255, alpha + rng.randint(-18, 18)))
+            draw.point((x + dx, y + dy), fill=color_base + (a,))
 
 
 def draw_textured_line(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], fill: tuple[int, int, int, int], width: int, jitter: float, rng: random.Random) -> None:
@@ -402,13 +699,21 @@ def draw_hand_overlay(
     heading: float = 0.0,
     contact: bool = True,
     lift: float = 0.0,
+    hand_video_overlay: HandVideoOverlay | None = None,
 ) -> None:
-    if getattr(settings, "hand_mode", "procedural") == "none":
+    mode = getattr(settings, "hand_mode", "procedural")
+    if mode == "none":
         return
     # Lift the visual hand/tip slightly during repositioning while keeping the
     # logical pencil tip aligned with the stroke endpoint.
-    lifted_tip = (tip[0], tip[1] - lift * 14.0)
-    if getattr(settings, "hand_mode", "procedural") == "uploaded" and getattr(settings, "hand_asset_path", ""):
+    lift_px = float(getattr(settings, "hand_lift_px", 14))
+    lifted_tip = (tip[0], tip[1] - lift * lift_px)
+    if mode == "video" and hand_video_overlay is not None:
+        asset = hand_video_overlay.frame(frame_idx, settings)
+        if asset is not None:
+            if draw_hand_asset_overlay(image, asset, lifted_tip, settings, frame_idx, heading, contact, lift, video_asset=True):
+                return
+    if mode == "uploaded" and getattr(settings, "hand_asset_path", ""):
         if draw_uploaded_hand_overlay(image, lifted_tip, settings, frame_idx, heading, contact, lift):
             return
     draw_procedural_hand_overlay(image, lifted_tip, settings, frame_idx, heading, contact, lift)
@@ -449,7 +754,22 @@ def draw_uploaded_hand_overlay(
         asset = Image.open(path).convert("RGBA")
     except Exception:
         return False
+    return draw_hand_asset_overlay(image, asset, tip, settings, frame_idx, heading, contact, lift, video_asset=False)
 
+
+def draw_hand_asset_overlay(
+    image: Image.Image,
+    asset: Image.Image,
+    tip: tuple[float, float],
+    settings: RenderSettings,
+    frame_idx: int,
+    heading: float,
+    contact: bool,
+    lift: float,
+    video_asset: bool = False,
+) -> bool:
+    if asset.width < 2 or asset.height < 2:
+        return False
     draw_contact_shadow(image, tip, contact, lift)
     base_side = min(settings.width, settings.height)
     target_w = max(32, int(base_side * (settings.hand_scale / 100)))
@@ -457,11 +777,15 @@ def draw_uploaded_hand_overlay(
     target_h = max(32, int(asset.height * scale))
     asset = asset.resize((target_w, target_h), Image.LANCZOS)
 
-    # Small live wobble helps even static assets feel filmed. We also allow the
-    # hand to respond slightly to stroke direction without spinning too much.
-    wobble = math.sin(frame_idx * 0.11) * (1.2 if contact else 2.0)
-    heading_degrees = math.degrees(heading) * 0.10
-    rotation = settings.hand_rotation + heading_degrees + wobble + lift * 3.0
+    # Hand video already contains natural finger/arm motion. Keep stroke-direction
+    # response subtle to avoid fighting the real footage. Static assets get more
+    # wobble to feel less frozen.
+    wobble_size = 0.45 if video_asset else (1.0 if contact else 1.8)
+    wobble = math.sin(frame_idx * 0.11) * wobble_size
+    correction = max(0.0, min(100.0, float(getattr(settings, "contact_correction_strength", 72)))) / 100.0
+    side_sign = -1 if getattr(settings, "hand_side", "right") == "left" else 1
+    heading_degrees = math.degrees(heading) * (0.045 + correction * (0.025 if video_asset else 0.07))
+    rotation = settings.hand_rotation + heading_degrees + wobble + lift * (1.2 if video_asset else 2.6) + side_sign * (1.6 * correction if contact else 0.0)
     anchor = (asset.width * settings.hand_tip_x / 100, asset.height * settings.hand_tip_y / 100)
     rotated, rotated_anchor = rotate_with_anchor(asset, rotation, anchor)
 
@@ -471,9 +795,12 @@ def draw_uploaded_hand_overlay(
 
     x, y = tip
     paste_x = int(x - rotated_anchor[0])
-    paste_y = int(y - rotated_anchor[1] - lift * 10)
-    shadow = alpha_shadow(rotated, opacity=54 if contact else 34, blur=5.5 + lift * 3)
-    image.alpha_composite(shadow, (paste_x + int(7 + lift * 6), paste_y + int(9 + lift * 8)))
+    paste_y = int(y - rotated_anchor[1] - lift * max(4, getattr(settings, "hand_lift_px", 14) * 0.7))
+    shadow_strength = max(0, min(100, int(getattr(settings, "hand_shadow_strength", 70)))) / 100.0
+    if shadow_strength > 0:
+        shadow_opacity = int((54 if contact else 34) * shadow_strength)
+        shadow = alpha_shadow(rotated, opacity=shadow_opacity, blur=5.5 + lift * 3)
+        image.alpha_composite(shadow, (paste_x + int(7 + lift * 6), paste_y + int(9 + lift * 8)))
     image.alpha_composite(rotated, (paste_x, paste_y))
     return True
 
@@ -516,7 +843,9 @@ def draw_procedural_hand_overlay(
     # Pencil body follows stroke direction a little, while preserving the user
     # supplied hand_rotation as the main grip angle.
     base_angle = math.radians(settings.hand_rotation) if hasattr(settings, "hand_rotation") else -0.70
-    pencil_angle = base_angle + heading * 0.13 + lift * 0.08
+    correction = max(0.0, min(100.0, float(getattr(settings, "contact_correction_strength", 72)))) / 100.0
+    side_sign = -1 if getattr(settings, "hand_side", "right") == "left" else 1
+    pencil_angle = base_angle + heading * (0.11 + correction * 0.08) + lift * 0.08 + side_sign * correction * 0.04
     length = 145 if settings.ratio != "16:9" else 105
     back_x = x + math.cos(pencil_angle) * length
     back_y = y + math.sin(pencil_angle) * length - lift * 12

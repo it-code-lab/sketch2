@@ -7,10 +7,11 @@ from typing import Any, Literal
 SubjectType = Literal["auto", "portrait", "architecture", "pet", "product", "landscape", "logo"]
 SketchStyle = Literal["pencil", "charcoal", "ink", "marker"]
 Ratio = Literal["9:16", "1:1", "16:9"]
+RenderQuality = Literal["preview", "standard", "final", "ultra"]
 TraceMode = Literal["opencv", "potrace", "vtracer", "auto"]
 StrokeExtractionMode = Literal["hybrid", "centerline", "contour"]
 PlanningMode = Literal["rule", "art_director_json"]
-HandMode = Literal["procedural", "uploaded", "none"]
+HandMode = Literal["procedural", "uploaded", "video", "none"]
 
 
 @dataclass
@@ -19,6 +20,7 @@ class RenderSettings:
     subject_type: SubjectType = "auto"
     style_type: SketchStyle = "pencil"
     ratio: Ratio = "9:16"
+    render_quality: RenderQuality = "standard"
     sketch_strength: int = 70
     stroke_density: int = 60
     human_randomness: int = 35
@@ -40,6 +42,13 @@ class RenderSettings:
     planning_mode: PlanningMode = "rule"
     art_director_json: str = ""
     camera_motion: bool = True
+    camera_move_preset: str = "static"
+    camera_zoom_start: int = 100
+    camera_zoom_end: int = 100
+    camera_pan_start_x: int = 0
+    camera_pan_start_y: int = 0
+    camera_pan_end_x: int = 0
+    camera_pan_end_y: int = 0
     smudge_pass: bool = True
     eraser_pass: bool = False
     title_card_text: str = ""
@@ -47,12 +56,39 @@ class RenderSettings:
 
     # Real hand overlay support. The path is set server-side after upload.
     hand_mode: HandMode = "procedural"
+    hand_preset: str = ""
+    hand_side: str = "right"
+    hand_asset_filename: str = ""
     hand_asset_path: str = ""
     hand_scale: int = 32
     hand_opacity: int = 95
     hand_rotation: int = -18
     hand_tip_x: int = 18
     hand_tip_y: int = 78
+    hand_video_loop: bool = True
+    hand_video_playback_rate: int = 100
+    hand_video_frame_offset: int = 0
+    hand_video_chroma_key: bool = False
+    hand_lift_px: int = 14
+    hand_shadow_strength: int = 70
+    contact_correction_strength: int = 72
+    contact_position_smoothing: int = 58
+    reposition_arc_strength: int = 55
+
+    # Batch 9 render-quality and advanced brush simulation controls.
+    graphite_grain: int = 65
+    charcoal_dust: int = 55
+    ink_bleed: int = 28
+    marker_overlap: int = 42
+    stroke_taper: int = 58
+    motion_blur_strength: int = 14
+
+    # Batch 12 audio design controls.
+    ambient_track: str = "none"
+    ambient_level: int = 18
+    drawing_audio_level: int = 70
+    transition_sfx: bool = True
+    transition_sfx_level: int = 30
 
     @classmethod
     def from_form(cls, form: dict[str, Any]) -> "RenderSettings":
@@ -78,6 +114,7 @@ class RenderSettings:
             subject_type=s("subject_type", "auto"),
             style_type=s("style_type", "pencil"),
             ratio=s("ratio", "9:16"),
+            render_quality=s("render_quality", "standard"),
             sketch_strength=i("sketch_strength", 70, 20, 100),
             stroke_density=i("stroke_density", 60, 10, 100),
             human_randomness=i("human_randomness", 35, 0, 100),
@@ -95,19 +132,49 @@ class RenderSettings:
             planning_mode=s("planning_mode", "rule"),
             art_director_json=s("art_director_json", ""),
             camera_motion=b("camera_motion", True),
+            camera_move_preset=s("camera_move_preset", "static"),
+            camera_zoom_start=i("camera_zoom_start", 100, 50, 200),
+            camera_zoom_end=i("camera_zoom_end", 100, 50, 200),
+            camera_pan_start_x=i("camera_pan_start_x", 0, -100, 100),
+            camera_pan_start_y=i("camera_pan_start_y", 0, -100, 100),
+            camera_pan_end_x=i("camera_pan_end_x", 0, -100, 100),
+            camera_pan_end_y=i("camera_pan_end_y", 0, -100, 100),
             smudge_pass=b("smudge_pass", True),
             eraser_pass=b("eraser_pass", False),
             title_card_text=s("title_card_text", "")[:140],
             watermark_text=s("watermark_text", "")[:80],
             hand_mode=s("hand_mode", "procedural"),
+            hand_preset=s("hand_preset", ""),
+            hand_side=s("hand_side", "right"),
+            hand_asset_filename=s("hand_asset_filename", ""),
             hand_asset_path=s("hand_asset_path", ""),
             hand_scale=i("hand_scale", 32, 8, 120),
             hand_opacity=i("hand_opacity", 95, 5, 100),
             hand_rotation=i("hand_rotation", -18, -180, 180),
             hand_tip_x=i("hand_tip_x", 18, 0, 100),
             hand_tip_y=i("hand_tip_y", 78, 0, 100),
+            hand_video_loop=b("hand_video_loop", True),
+            hand_video_playback_rate=i("hand_video_playback_rate", 100, 25, 400),
+            hand_video_frame_offset=i("hand_video_frame_offset", 0, -2000, 2000),
+            hand_video_chroma_key=b("hand_video_chroma_key", False),
+            hand_lift_px=i("hand_lift_px", 14, 0, 80),
+            hand_shadow_strength=i("hand_shadow_strength", 70, 0, 100),
+            contact_correction_strength=i("contact_correction_strength", 72, 0, 100),
+            contact_position_smoothing=i("contact_position_smoothing", 58, 0, 100),
+            reposition_arc_strength=i("reposition_arc_strength", 55, 0, 100),
+            graphite_grain=i("graphite_grain", 65, 0, 100),
+            charcoal_dust=i("charcoal_dust", 55, 0, 100),
+            ink_bleed=i("ink_bleed", 28, 0, 100),
+            marker_overlap=i("marker_overlap", 42, 0, 100),
+            stroke_taper=i("stroke_taper", 58, 0, 100),
+            motion_blur_strength=i("motion_blur_strength", 14, 0, 100),
+            ambient_track=s("ambient_track", "none"),
+            ambient_level=i("ambient_level", 18, 0, 100),
+            drawing_audio_level=i("drawing_audio_level", 70, 0, 100),
+            transition_sfx=b("transition_sfx", True),
+            transition_sfx_level=i("transition_sfx_level", 30, 0, 100),
         )
-        settings.width, settings.height = ratio_to_size(settings.ratio)
+        settings.width, settings.height = ratio_to_size(settings.ratio, settings.render_quality)
         return settings
 
     def to_dict(self) -> dict[str, Any]:
@@ -118,14 +185,14 @@ class RenderSettings:
         return payload
 
 
-def ratio_to_size(ratio: str) -> tuple[int, int]:
-    # Batch 3 defaults are optimized for local rendering speed. Increase these
-    # values later for final 1080p/4K exports after the queue and renderer are stable.
-    if ratio == "1:1":
-        return 720, 720
-    if ratio == "16:9":
-        return 960, 540
-    return 540, 960
+def ratio_to_size(ratio: str, render_quality: str = "standard") -> tuple[int, int]:
+    quality_map = {
+        "preview": {"9:16": (540, 960), "1:1": (720, 720), "16:9": (960, 540)},
+        "standard": {"9:16": (720, 1280), "1:1": (900, 900), "16:9": (1280, 720)},
+        "final": {"9:16": (1080, 1920), "1:1": (1440, 1440), "16:9": (1920, 1080)},
+        "ultra": {"9:16": (1440, 2560), "1:1": (2048, 2048), "16:9": (2560, 1440)},
+    }
+    return quality_map.get(render_quality, quality_map["standard"]).get(ratio, quality_map["standard"]["9:16"])
 
 
 @dataclass

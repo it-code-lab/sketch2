@@ -9,21 +9,103 @@
 <body>
   <header class="hero">
     <div>
-      <p class="eyebrow">Batch 5 Centerline + Hand Realism Upgrade</p>
+      <p class="eyebrow">Batch 14 AI Art Director + Quality Scoring</p>
       <h1>AI Street Sketch Video Studio</h1>
-      <p class="subtitle">Turn a final image or sketch into a realistic street-artist drawing video with true centerline stroke extraction, semantic layer planning, smoother hand movement, real hand overlay support, pencil audio, and MP4 export.</p>
+      <p class="subtitle">Turn one or many final images/sketches into realistic street-artist drawing videos with AI-ready Art Director analysis, quality scoring, automatic subject/style suggestions, editable planning JSON, visual timeline editing, storyboard preview, multi-layer audio design, cinematic camera moves, realistic hand overlay support, and MP4 export.</p>
     </div>
     <div class="health" id="healthBox">Checking backend…</div>
   </header>
 
   <main class="app-shell">
     <section class="panel controls">
+      <h2>0. User profiles</h2>
+      <div class="grid two">
+        <label>Saved profile
+          <select id="profile_select"><option value="">Select saved profile…</option></select>
+        </label>
+        <label>Profile name
+          <input type="text" id="profile_name" maxlength="80" placeholder="My Pencil Shorts Profile" />
+        </label>
+      </div>
+      <label>Profile notes
+        <input type="text" id="profile_notes" maxlength="300" placeholder="Optional notes about asset, style, and camera angle" />
+      </label>
+      <div class="mini-actions">
+        <button type="button" id="refreshProfilesBtn">Refresh profiles</button>
+        <button type="button" id="loadProfileBtn">Load profile</button>
+        <button type="button" id="saveProfileBtn">Save current settings</button>
+        <button type="button" id="deleteProfileBtn">Delete profile</button>
+      </div>
       <h2>1. Input</h2>
       <label class="drop-zone" id="dropZone">
         <input type="file" id="imageInput" accept="image/*" />
         <span>Drop or choose final image / sketch</span>
       </label>
       <img id="sourcePreview" class="preview hidden" alt="Source preview" />
+
+      <details class="advanced" open>
+        <summary>AI Art Director + quality scoring</summary>
+        <p>Analyze the uploaded image or timeline scenes before rendering. This local analysis creates quality warnings, subject/style suggestions, render-setting recommendations, captions, and editable Art Director JSON.</p>
+        <div class="mini-actions">
+          <button type="button" id="artDirectorBtn">Analyze current image</button>
+          <button type="button" id="timelineArtDirectorBtn">Analyze timeline scenes</button>
+          <button type="button" id="applyArtDirectorBtn">Apply recommendations</button>
+        </div>
+        <div id="qualitySummary" class="quality-summary empty">Run Art Director analysis to see quality score and recommendations.</div>
+        <div id="artDirectorRecommendations" class="art-director-report empty">No Art Director report yet.</div>
+      </details>
+
+      <details class="advanced" open>
+        <summary>Multi-scene timeline</summary>
+        <p>Upload multiple finished images or sketches, build a timeline JSON, and render one stitched sketching video across many scenes.</p>
+        <div class="grid two">
+          <label>Timeline project name
+            <input type="text" id="timeline_project_name" maxlength="80" value="sketch_timeline" />
+          </label>
+          <label>Timeline scene images
+            <input type="file" id="timelineFiles" accept="image/*" multiple />
+          </label>
+        </div>
+        <div class="mini-actions">
+          <button type="button" id="buildTimelineBtn">Build visual timeline</button>
+          <button type="button" id="syncTimelineBtn">Sync editor from JSON</button>
+          <button type="button" id="playTimelinePreviewBtn">Play storyboard preview</button>
+          <button type="button" id="renderTimelineBtn">Render multi-scene timeline</button>
+        </div>
+        <div id="timelineStats" class="timeline-stats">No timeline scenes yet.</div>
+        <div id="storyboardPreview" class="storyboard-preview empty">
+          <div class="storyboard-frame"><span>Storyboard preview will appear here.</span><img id="storyboardPreviewImage" class="hidden" alt="Storyboard preview" /></div>
+          <div id="storyboardPreviewCaption" class="storyboard-caption">Select images and build the timeline.</div>
+        </div>
+        <div id="timelineEditor" class="timeline-editor empty">Build the timeline to edit scenes visually.</div>
+        <label>Timeline JSON
+          <textarea id="timeline_json" spellcheck="false">[
+  {
+    "scene_id": "scene_01",
+    "source": "scene1.png",
+    "title": "Scene 1",
+    "duration_seconds": 6,
+    "transition": "cut",
+    "transition_duration": 0.0,
+    "camera_move_preset": "zoom_in"
+  },
+  {
+    "scene_id": "scene_02",
+    "source": "scene2.png",
+    "title": "Scene 2",
+    "duration_seconds": 6,
+    "transition": "zoomfade",
+    "transition_duration": 0.8,
+    "camera_move_preset": "ken_burns",
+    "ambient_track": "street_busker",
+    "camera_zoom_start": 108,
+    "camera_zoom_end": 126,
+    "camera_pan_start_x": -18,
+    "camera_pan_end_x": 18
+  }
+]</textarea>
+        </label>
+      </details>
 
       <div class="grid two">
         <label>Input type
@@ -39,6 +121,9 @@
         </label>
         <label>Video ratio
           <select id="ratio"><option value="9:16">9:16 Shorts</option><option value="1:1">1:1 Square</option><option value="16:9">16:9 YouTube</option></select>
+        </label>
+        <label>Render quality
+          <select id="render_quality"><option value="preview">Preview (fast)</option><option value="standard" selected>Standard HD</option><option value="final">Final 1080p</option><option value="ultra">Ultra 1440p/2K</option></select>
         </label>
       </div>
 
@@ -105,13 +190,119 @@
         <label><input type="checkbox" id="pencil_audio" checked /> Pencil scratch audio</label>
       </div>
 
+      <details class="advanced" open>
+        <summary>Advanced brush simulation</summary>
+        <div class="grid two">
+          <label>Graphite grain <span id="graphite_grain_val">65</span>
+            <input type="range" id="graphite_grain" min="0" max="100" value="65" />
+          </label>
+          <label>Charcoal dust <span id="charcoal_dust_val">55</span>
+            <input type="range" id="charcoal_dust" min="0" max="100" value="55" />
+          </label>
+          <label>Ink bleed <span id="ink_bleed_val">28</span>
+            <input type="range" id="ink_bleed" min="0" max="100" value="28" />
+          </label>
+          <label>Marker overlap <span id="marker_overlap_val">42</span>
+            <input type="range" id="marker_overlap" min="0" max="100" value="42" />
+          </label>
+          <label>Stroke taper <span id="stroke_taper_val">58</span>
+            <input type="range" id="stroke_taper" min="0" max="100" value="58" />
+          </label>
+          <label>Motion blur <span id="motion_blur_strength_val">14</span>
+            <input type="range" id="motion_blur_strength" min="0" max="100" value="14" />
+          </label>
+        </div>
+      </details>
+
+            <details class="advanced" open>
+        <summary>Audio design</summary>
+        <div class="grid two">
+          <label>Ambient track
+            <select id="ambient_track">
+              <option value="none">None</option>
+              <option value="studio_room">Studio room</option>
+              <option value="paper_rustle">Paper rustle</option>
+              <option value="street_busker">Street busker ambience</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="transition_sfx" checked /> Transition sound effects</label>
+        </div>
+        <div class="grid two">
+          <label>Drawing audio level <span id="drawing_audio_level_val">70</span>
+            <input type="range" id="drawing_audio_level" min="0" max="100" value="70" />
+          </label>
+          <label>Ambient level <span id="ambient_level_val">18</span>
+            <input type="range" id="ambient_level" min="0" max="100" value="18" />
+          </label>
+          <label>Transition SFX level <span id="transition_sfx_level_val">30</span>
+            <input type="range" id="transition_sfx_level" min="0" max="100" value="30" />
+          </label>
+        </div>
+      </details>
+
+      <details class="advanced" open>
+        <summary>Camera moves and framing</summary>
+        <div class="grid two">
+          <label>Camera move preset
+            <select id="camera_move_preset">
+              <option value="static">Static</option>
+              <option value="zoom_in">Zoom in</option>
+              <option value="zoom_out">Zoom out</option>
+              <option value="pan_left_to_right">Pan left to right</option>
+              <option value="pan_right_to_left">Pan right to left</option>
+              <option value="pan_top_to_bottom">Pan top to bottom</option>
+              <option value="pan_bottom_to_top">Pan bottom to top</option>
+              <option value="ken_burns">Ken Burns</option>
+              <option value="push_in_left">Push in left</option>
+              <option value="push_in_right">Push in right</option>
+            </select>
+          </label>
+        </div>
+        <div class="grid two">
+          <label>Zoom start % <span id="camera_zoom_start_val">100</span>
+            <input type="range" id="camera_zoom_start" min="80" max="160" value="100" />
+          </label>
+          <label>Zoom end % <span id="camera_zoom_end_val">100</span>
+            <input type="range" id="camera_zoom_end" min="80" max="160" value="100" />
+          </label>
+          <label>Pan start X <span id="camera_pan_start_x_val">0</span>
+            <input type="range" id="camera_pan_start_x" min="-100" max="100" value="0" />
+          </label>
+          <label>Pan start Y <span id="camera_pan_start_y_val">0</span>
+            <input type="range" id="camera_pan_start_y" min="-100" max="100" value="0" />
+          </label>
+          <label>Pan end X <span id="camera_pan_end_x_val">0</span>
+            <input type="range" id="camera_pan_end_x" min="-100" max="100" value="0" />
+          </label>
+          <label>Pan end Y <span id="camera_pan_end_y_val">0</span>
+            <input type="range" id="camera_pan_end_y" min="-100" max="100" value="0" />
+          </label>
+        </div>
+      </details>
+
       <h2>4. Hand overlay</h2>
       <div class="grid two">
+        <label>Hand preset
+          <select id="hand_preset"><option value="">Load preset…</option></select>
+        </label>
+        <label>Hand side
+          <select id="hand_side"><option value="right">Right-handed</option><option value="left">Left-handed</option></select>
+        </label>
+        <label>Saved hand asset library
+          <select id="hand_asset_filename"><option value="">Use uploaded asset only</option></select>
+        </label>
+        <div class="mini-actions">
+          <button type="button" id="refreshAssetsBtn">Refresh library</button>
+          <button type="button" id="applyPresetBtn">Apply preset</button>
+          <button type="button" id="autoDetectTipBtn">Auto-detect tip</button>
+        </div>
+      </div>
+      <div class="grid two">
         <label>Hand mode
-          <select id="hand_mode"><option value="procedural">Procedural hand/pen</option><option value="uploaded">Uploaded transparent hand PNG</option><option value="none">No hand</option></select>
+          <select id="hand_mode"><option value="procedural">Procedural hand/pen</option><option value="uploaded">Uploaded transparent hand image</option><option value="video">Transparent hand video</option><option value="none">No hand</option></select>
         </label>
         <label>Upload hand asset
-          <input type="file" id="handAsset" accept="image/png,image/webp,image/jpeg" />
+          <input type="file" id="handAsset" accept="image/png,image/webp,image/jpeg,video/webm,video/mp4,video/quicktime,video/x-matroska" />
         </label>
         <label>Scale <span id="hand_scale_val">32</span>
           <input type="range" id="hand_scale" min="8" max="120" value="32" />
@@ -128,7 +319,53 @@
         <label>Tip Y %
           <input type="number" id="hand_tip_y" min="0" max="100" value="78" />
         </label>
+        <label>Hand lift px
+          <input type="number" id="hand_lift_px" min="0" max="80" value="14" />
+        </label>
+        <label>Shadow strength <span id="hand_shadow_strength_val">70</span>
+          <input type="range" id="hand_shadow_strength" min="0" max="100" value="70" />
+        </label>
       </div>
+      <div class="grid two">
+        <label>Contact correction <span id="contact_correction_strength_val">72</span>
+          <input type="range" id="contact_correction_strength" min="0" max="100" value="72" />
+        </label>
+        <label>Contact smoothing <span id="contact_position_smoothing_val">58</span>
+          <input type="range" id="contact_position_smoothing" min="0" max="100" value="58" />
+        </label>
+        <label>Reposition arc strength <span id="reposition_arc_strength_val">55</span>
+          <input type="range" id="reposition_arc_strength" min="0" max="100" value="55" />
+        </label>
+      </div>
+
+      <details class="advanced" open>
+        <summary>Pencil-tip calibration</summary>
+        <p>Upload your transparent hand image/video, then click exactly where the pencil tip touches the paper. The X/Y percentages will update automatically.</p>
+        <div class="calibration-box" id="calibrationBox">
+          <img id="handCalibImage" class="calib-media hidden" alt="Hand calibration image" />
+          <video id="handCalibVideo" class="calib-media hidden" muted loop playsinline></video>
+          <div class="calib-empty" id="calibEmpty">Upload a hand image/video to calibrate the pencil tip.</div>
+          <div class="tip-crosshair" id="tipCrosshair"></div>
+        </div>
+        <div class="calib-actions">
+          <button type="button" id="playHandPreviewBtn">Play/Pause hand preview</button>
+          <span id="calibrationReadout">Tip anchor: 18%, 78%</span><span id="assetLibraryStatus">Library ready.</span>
+        </div>
+      </details>
+
+      <details class="advanced">
+        <summary>Transparent hand video options</summary>
+        <div class="grid two">
+          <label><input type="checkbox" id="hand_video_loop" checked /> Loop hand video</label>
+          <label><input type="checkbox" id="hand_video_chroma_key" /> Remove green-screen background</label>
+          <label>Playback rate %
+            <input type="number" id="hand_video_playback_rate" min="25" max="400" value="100" />
+          </label>
+          <label>Frame offset
+            <input type="number" id="hand_video_frame_offset" min="-2000" max="2000" value="0" />
+          </label>
+        </div>
+      </details>
 
       <h2>5. Branding</h2>
       <div class="grid two">
