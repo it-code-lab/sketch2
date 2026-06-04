@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Street Sketch Video Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Batch 3 Premium Local App</p>
+      <h1>AI Street Sketch Video Studio</h1>
+      <p class="subtitle">Turn a final image or sketch into a realistic street-artist drawing video with human-like passes, real hand overlay support, pencil audio, and MP4 export.</p>
+    </div>
+    <div class="health" id="healthBox">Checking backend…</div>
+  </header>
+
+  <main class="app-shell">
+    <section class="panel controls">
+      <h2>1. Input</h2>
+      <label class="drop-zone" id="dropZone">
+        <input type="file" id="imageInput" accept="image/*" />
+        <span>Drop or choose final image / sketch</span>
+      </label>
+      <img id="sourcePreview" class="preview hidden" alt="Source preview" />
+
+      <div class="grid two">
+        <label>Input type
+          <select id="input_type"><option value="photo">Photo → sketch</option><option value="sketch">Already a sketch</option></select>
+        </label>
+        <label>Subject template
+          <select id="subject_type">
+            <option value="auto">Auto</option><option value="portrait">Portrait</option><option value="architecture">Temple / Architecture</option><option value="pet">Pet / Animal</option><option value="product">Product / Object</option><option value="landscape">Landscape</option><option value="logo">Logo / Icon</option>
+          </select>
+        </label>
+        <label>Art style
+          <select id="style_type"><option value="pencil">Pencil</option><option value="charcoal">Charcoal</option><option value="ink">Ink</option><option value="marker">Marker</option></select>
+        </label>
+        <label>Video ratio
+          <select id="ratio"><option value="9:16">9:16 Shorts</option><option value="1:1">1:1 Square</option><option value="16:9">16:9 YouTube</option></select>
+        </label>
+      </div>
+
+      <h2>2. Artist planning</h2>
+      <div class="grid two">
+        <label>Trace mode
+          <select id="trace_mode"><option value="opencv">OpenCV strokes</option><option value="auto">Auto SVG sidecar</option><option value="potrace">Potrace sidecar</option><option value="vtracer">VTracer sidecar</option></select>
+        </label>
+        <label>Planning mode
+          <select id="planning_mode"><option value="rule">Rule-based artist order</option><option value="art_director_json">Art Director JSON</option></select>
+        </label>
+      </div>
+      <details class="advanced">
+        <summary>Optional Art Director JSON</summary>
+        <p>Use this later with a vision model or hand-written plan. Negative priority draws earlier; positive priority draws later.</p>
+        <textarea id="art_director_json" spellcheck="false">{
+  "subject_type": "portrait",
+  "region_priority": {
+    "left_eye": -22,
+    "right_eye": -22,
+    "nose": -10,
+    "mouth": -7,
+    "hair_top": 12,
+    "neck_clothing": 18
+  },
+  "region_layer_overrides": {
+    "left_eye": "key",
+    "right_eye": "key"
+  }
+}</textarea>
+      </details>
+
+      <h2>3. Realism settings</h2>
+      <div class="grid two">
+        <label>Sketch strength <span id="sketch_strength_val">70</span>
+          <input type="range" id="sketch_strength" min="20" max="100" value="70" />
+        </label>
+        <label>Stroke density <span id="stroke_density_val">60</span>
+          <input type="range" id="stroke_density" min="10" max="100" value="60" />
+        </label>
+        <label>Human randomness <span id="human_randomness_val">35</span>
+          <input type="range" id="human_randomness" min="0" max="100" value="35" />
+        </label>
+        <label>Max strokes
+          <input type="number" id="max_strokes" min="250" max="12000" value="1800" />
+        </label>
+        <label>Duration seconds
+          <input type="number" id="duration_seconds" min="5" max="240" value="18" />
+        </label>
+        <label>FPS
+          <input type="number" id="fps" min="12" max="60" value="24" />
+        </label>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="paper_texture" checked /> Paper texture</label>
+        <label><input type="checkbox" id="construction_pass" checked /> Construction pass</label>
+        <label><input type="checkbox" id="accent_pass" checked /> Final accent pass</label>
+        <label><input type="checkbox" id="smudge_pass" checked /> Smudge pass</label>
+        <label><input type="checkbox" id="eraser_pass" /> Eraser highlight pass</label>
+        <label><input type="checkbox" id="camera_motion" checked /> Subtle camera motion</label>
+        <label><input type="checkbox" id="pencil_audio" checked /> Pencil scratch audio</label>
+      </div>
+
+      <h2>4. Hand overlay</h2>
+      <div class="grid two">
+        <label>Hand mode
+          <select id="hand_mode"><option value="procedural">Procedural hand/pen</option><option value="uploaded">Uploaded transparent hand PNG</option><option value="none">No hand</option></select>
+        </label>
+        <label>Upload hand asset
+          <input type="file" id="handAsset" accept="image/png,image/webp,image/jpeg" />
+        </label>
+        <label>Scale <span id="hand_scale_val">32</span>
+          <input type="range" id="hand_scale" min="8" max="120" value="32" />
+        </label>
+        <label>Opacity <span id="hand_opacity_val">95</span>
+          <input type="range" id="hand_opacity" min="5" max="100" value="95" />
+        </label>
+        <label>Rotation
+          <input type="number" id="hand_rotation" min="-180" max="180" value="-18" />
+        </label>
+        <label>Tip X %
+          <input type="number" id="hand_tip_x" min="0" max="100" value="18" />
+        </label>
+        <label>Tip Y %
+          <input type="number" id="hand_tip_y" min="0" max="100" value="78" />
+        </label>
+      </div>
+
+      <h2>5. Branding</h2>
+      <div class="grid two">
+        <label>Opening title
+          <input type="text" id="title_card_text" maxlength="140" placeholder="Watch this street sketch come alive" />
+        </label>
+        <label>Watermark
+          <input type="text" id="watermark_text" maxlength="80" placeholder="lab.readernook.com" />
+        </label>
+        <label>Seed
+          <input type="number" id="seed" min="1" max="2000000000" value="12345" />
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="analyzeBtn">Analyze stroke plan</button>
+        <button id="renderBtn" class="primary">Render MP4 with queue</button>
+      </div>
+    </section>
+
+    <section class="panel output">
+      <h2>Preview & output</h2>
+      <div class="previews">
+        <div><h3>Sketch preview</h3><img id="sketchPreview" class="preview placeholder" alt="Sketch preview" /></div>
+        <div><h3>Rendered video</h3><video id="videoOutput" controls class="video hidden"></video></div>
+      </div>
+      <div class="progress-wrap hidden" id="progressWrap">
+        <div class="progress"><div id="progressBar"></div></div>
+        <p id="progressText">Queued…</p>
+      </div>
+      <div class="download-links" id="downloadLinks"></div>
+      <h3>Pass summary</h3>
+      <div id="passSummary" class="pass-summary empty">Analyze an image to see the artist passes.</div>
+      <h3>Warnings / logs</h3>
+      <pre id="logBox">Ready.</pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
