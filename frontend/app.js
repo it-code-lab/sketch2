@@ -10,6 +10,8 @@ const progressText = $('progressText');
 const downloadLinks = $('downloadLinks');
 const videoOutput = $('videoOutput');
 const quickPreviewBtn = $('quickPreviewBtn');
+const cleanupOutputsBtn = $('cleanupOutputsBtn');
+const cleanupStatus = $('cleanupStatus');
 const motionPreviewCanvas = $('motionPreviewCanvas');
 const sourcePreview = $('sourcePreview');
 const sketchPreview = $('sketchPreview');
@@ -112,6 +114,7 @@ syncTimelineBtn.addEventListener('click', () => syncEditorFromTimelineJson());
 playTimelinePreviewBtn.addEventListener('click', () => toggleStoryboardPreview());
 renderTimelineBtn.addEventListener('click', () => renderTimelineQueued());
 quickPreviewBtn.addEventListener('click', () => toggleQuickMotionPreview());
+cleanupOutputsBtn.addEventListener('click', () => cleanupGeneratedOutputs());
 cameraMovePreset.addEventListener('change', () => applyCameraPreset());
 artDirectorBtn.addEventListener('click', () => analyzeCurrentImageWithArtDirector());
 timelineArtDirectorBtn.addEventListener('click', () => analyzeTimelineWithArtDirector());
@@ -1053,10 +1056,42 @@ async function pollJob(jobId) {
       log('Render complete.', data.result.warnings || []);
       return;
     }
+    if (data.status === 'expired') {
+      handleRenderResult(data.result);
+      log(data.message || 'This render no longer has files in the outputs folder.', data.result?.warnings || []);
+      return;
+    }
     if (data.status === 'failed') {
       throw new Error(data.error || 'Render failed');
     }
     await new Promise(resolve => setTimeout(resolve, 1100));
+  }
+}
+
+async function cleanupGeneratedOutputs() {
+  const ok = window.confirm('Delete generated videos, previews, plans, audio, and frame folders from outputs? Hand assets and saved profiles will be kept.');
+  if (!ok) return;
+  try {
+    setBusy(true);
+    cleanupOutputsBtn.disabled = true;
+    cleanupStatus.textContent = 'Cleaning generated files...';
+    const res = await fetch('/api/outputs/cleanup', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Could not clean generated files.');
+    stopQuickMotionPreview();
+    resetRenderedVideo();
+    downloadLinks.innerHTML = '<p class="muted">Generated files were cleaned. Start a new render to create fresh downloads.</p>';
+    progressWrap.classList.add('hidden');
+    const reclaimedMb = (Number(data.reclaimed_bytes || 0) / (1024 * 1024)).toFixed(1);
+    const summary = `Removed ${data.removed_files || 0} files and ${data.removed_dirs || 0} folders (${reclaimedMb} MB).`;
+    cleanupStatus.textContent = summary;
+    log(summary, data.errors || []);
+  } catch (err) {
+    cleanupStatus.textContent = 'Cleanup failed.';
+    log(err.message || String(err));
+  } finally {
+    cleanupOutputsBtn.disabled = false;
+    setBusy(false);
   }
 }
 
@@ -1066,6 +1101,11 @@ function handleRenderResult(result) {
   renderSemanticSummary(result.semantic_regions || [], result.layer_plan || []);
   const files = result.files || {};
   downloadLinks.innerHTML = '';
+  if (!Object.keys(files).length) {
+    resetRenderedVideo();
+    downloadLinks.innerHTML = '<p class="muted">Render files were removed from the outputs folder. Start a new render to create fresh downloads.</p>';
+    return;
+  }
   for (const [name, url] of Object.entries(files)) {
     const a = document.createElement('a');
     a.href = url;

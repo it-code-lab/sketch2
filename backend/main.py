@@ -206,6 +206,65 @@ def public_result(result: dict[str, Any]) -> dict[str, str]:
     return public
 
 
+def scrub_missing_output_files(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return payload
+    files = result.get("files")
+    if not isinstance(files, dict):
+        return payload
+
+    missing: list[str] = []
+    for key, url in list(files.items()):
+        filename = Path(str(url)).name
+        if not filename or not (OUTPUT_DIR / filename).exists():
+            missing.append(key)
+            files.pop(key, None)
+
+    if missing:
+        warnings = result.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            warning = "Some render files were removed from the outputs folder: " + ", ".join(sorted(missing))
+            if warning not in warnings:
+                warnings.append(warning)
+        if payload.get("status") == "done" and not files:
+            payload["status"] = "expired"
+            payload["message"] = "Render files were removed from the outputs folder"
+    return payload
+
+
+def cleanup_generated_outputs() -> dict[str, Any]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    removed_files = 0
+    removed_dirs = 0
+    reclaimed_bytes = 0
+    errors: list[str] = []
+
+    for child in OUTPUT_DIR.iterdir():
+        if child.name == ".gitkeep":
+            continue
+        try:
+            if child.is_dir():
+                reclaimed_bytes += sum(path.stat().st_size for path in child.rglob("*") if path.is_file())
+                shutil.rmtree(child)
+                removed_dirs += 1
+            else:
+                reclaimed_bytes += child.stat().st_size
+                child.unlink()
+                removed_files += 1
+        except Exception as exc:
+            errors.append(f"{child.name}: {exc}")
+
+    return {
+        "removed_files": removed_files,
+        "removed_dirs": removed_dirs,
+        "reclaimed_bytes": reclaimed_bytes,
+        "errors": errors,
+    }
+
+
 def run_render_job(job_id: str, image_bytes: bytes, settings: RenderSettings) -> None:
     try:
         jobs.update(job_id, status="analyzing", progress=4, message="Analyzing sketch and planning human-like stroke order")
@@ -783,7 +842,7 @@ async def render_timeline_queued(
 
 @app.get("/api/jobs")
 def list_jobs() -> dict[str, Any]:
-    return {"jobs": jobs.recent()}
+    return {"jobs": [scrub_missing_output_files(job) for job in jobs.recent()]}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -791,7 +850,12 @@ def get_job(job_id: str) -> JSONResponse:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return JSONResponse(job.to_dict())
+    return JSONResponse(scrub_missing_output_files(job.to_dict()))
+
+
+@app.post("/api/outputs/cleanup")
+def cleanup_outputs() -> JSONResponse:
+    return JSONResponse(cleanup_generated_outputs())
 
 
 @app.post("/api/batch-render")
