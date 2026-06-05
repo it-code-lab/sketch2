@@ -17,6 +17,7 @@ from backend.services.centerline_extractor import make_centerline_paths
 from backend.services.semantic_planning import (
     SemanticRegion,
     build_layer_plan,
+    clamp_bbox,
     decide_semantic_layer,
     detect_semantic_regions,
     select_region_for_stroke,
@@ -280,6 +281,7 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
         subject = str(art_director["subject_type"])
 
     semantic_regions = detect_semantic_regions(darkness, subject, settings.width, settings.height)
+    apply_section_region_overrides(semantic_regions, art_director, settings.width, settings.height)
     layer_plan = build_layer_plan(subject, semantic_regions)
 
     strokes: list[Stroke] = []
@@ -311,7 +313,7 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if not strokes:
         strokes.extend(create_fallback_strokes(settings, rng))
 
-    apply_semantic_region_detection(strokes, semantic_regions)
+    apply_semantic_region_detection(strokes, semantic_regions, section_polygons(art_director, settings.width, settings.height))
     apply_art_director_to_strokes(strokes, art_director, settings)
     apply_professional_stroke_polish(strokes, settings)
 
@@ -319,7 +321,9 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     strokes = limit_strokes(strokes, settings.max_strokes)
     apply_artist_order(strokes, subject, settings, rng)
     apply_art_director_to_order(strokes, art_director)
-    apply_guided_artist_sequence(strokes, subject, settings, art_director)
+    section_guided = apply_section_guidance(strokes, subject, settings, art_director)
+    if not section_guided:
+        apply_guided_artist_sequence(strokes, subject, settings, art_director)
     assign_timing(strokes, settings, rng)
     summary = summarize_passes(strokes)
 
@@ -352,18 +356,145 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
 
 
 
-def apply_semantic_region_detection(strokes: list[Stroke], semantic_regions: list[SemanticRegion]) -> None:
+def apply_semantic_region_detection(strokes: list[Stroke], semantic_regions: list[SemanticRegion], polygons: dict[str, list[tuple[float, float]]] | None = None) -> None:
     if not semantic_regions:
         return
+    polygons = polygons or {}
     for stroke in strokes:
         x1, y1, x2, y2 = stroke.bbox
         center = ((x1 + x2) / 2, (y1 + y2) / 2)
-        region = select_region_for_stroke(stroke.bbox, center, semantic_regions)
+        region = next((candidate for candidate in semantic_regions if candidate.name in polygons and point_in_polygon(center, polygons[candidate.name])), None)
+        if region is None:
+            region = select_region_for_stroke(stroke.bbox, center, semantic_regions)
         if region is None:
             continue
         stroke.region = region.name
         stroke.layer = decide_semantic_layer(stroke.layer, region, stroke.length, stroke.darkness, stroke.effect)
         stroke.order_score = min(stroke.order_score, LAYER_WEIGHT.get(stroke.layer, 50) + region.priority)
+
+
+def section_polygons(plan: dict[str, object], width: int, height: int) -> dict[str, list[tuple[float, float]]]:
+    sequence = plan.get("section_sequence") if plan else None
+    if not isinstance(sequence, list):
+        return {}
+    polygons: dict[str, list[tuple[float, float]]] = {}
+    for raw in sequence:
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "")).strip()
+        polygon = polygon_from_section(raw, width, height)
+        if region and polygon:
+            polygons[region] = polygon
+    return polygons
+
+
+def polygon_from_section(raw: dict[str, object], width: int, height: int) -> list[tuple[float, float]]:
+    polygon = raw.get("polygon")
+    polygon_pct = raw.get("polygon_pct")
+    if isinstance(polygon, list):
+        points = parse_polygon_points(polygon)
+        if len(points) >= 3:
+            return [(max(0, min(width - 1, x)), max(0, min(height - 1, y))) for x, y in points]
+    if isinstance(polygon_pct, list):
+        points = parse_polygon_points(polygon_pct)
+        if len(points) >= 3:
+            return [(max(0, min(width - 1, x / 100 * width)), max(0, min(height - 1, y / 100 * height))) for x, y in points]
+    return []
+
+
+def parse_polygon_points(values: list[object]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for point in values:
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            points.append((safe_float(point[0], 0), safe_float(point[1], 0)))
+    return points
+
+
+def point_in_polygon(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i, (xi, yi) in enumerate(polygon):
+        xj, yj = polygon[j]
+        intersects = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / max(1e-6, yj - yi) + xi)
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def apply_section_region_overrides(semantic_regions: list[SemanticRegion], plan: dict[str, object], width: int, height: int) -> None:
+    sequence = plan.get("section_sequence") if plan else None
+    if not isinstance(sequence, list):
+        return
+    by_name = {region.name: region for region in semantic_regions}
+    for raw in sequence:
+        if not isinstance(raw, dict):
+            continue
+        region_name = str(raw.get("region", "")).strip()
+        if not region_name:
+            continue
+        region = by_name.get(region_name)
+        bbox = raw.get("bbox")
+        bbox_pct = raw.get("bbox_pct")
+        polygon = polygon_from_section(raw, width, height)
+        next_bbox: tuple[float, float, float, float] | None = None
+        if isinstance(bbox, list) and len(bbox) == 4:
+            vals = [safe_float(value, 0) for value in bbox]
+            next_bbox = clamp_bbox(vals[0], vals[1], vals[2], vals[3], width, height)
+        elif isinstance(bbox_pct, list) and len(bbox_pct) == 4:
+            vals = [safe_float(value, 0) for value in bbox_pct]
+            x1 = vals[0] / 100 * width
+            y1 = vals[1] / 100 * height
+            x2 = (vals[0] + vals[2]) / 100 * width
+            y2 = (vals[1] + vals[3]) / 100 * height
+            next_bbox = clamp_bbox(x1, y1, x2, y2, width, height)
+        elif polygon:
+            xs = [point[0] for point in polygon]
+            ys = [point[1] for point in polygon]
+            next_bbox = clamp_bbox(min(xs), min(ys), max(xs), max(ys), width, height)
+        if next_bbox is not None:
+            if region is None:
+                region = SemanticRegion(
+                    region_name,
+                    section_role(region_name),
+                    next_bbox,
+                    section_priority(region_name),
+                    0.92,
+                    section_layers(region_name),
+                    "User-created drawing part.",
+                )
+                semantic_regions.append(region)
+                by_name[region_name] = region
+            region.bbox = next_bbox
+            region.notes = (region.notes + " User-adjusted area.").strip()
+
+
+def section_role(region: str) -> str:
+    if any(token in region for token in ["eye", "mouth", "nose", "entrance", "detail"]):
+        return "focal"
+    if any(token in region for token in ["hair", "ground", "clothing", "pillar"]):
+        return "support"
+    return "form"
+
+
+def section_priority(region: str) -> float:
+    order = {
+        "left_eye": -18, "right_eye": -18, "left_eyebrow": -16, "right_eyebrow": -16,
+        "mouth": -12, "nose": -10, "face_outline": -8, "jaw_cheek": -4,
+        "hair_top": 8, "hair_side": 10, "neck_clothing": 14,
+    }
+    return float(order.get(region, 0))
+
+
+def section_layers(region: str) -> list[str]:
+    if "eye" in region or region in {"mouth", "nose"}:
+        return ["key", "secondary", "accent"]
+    if "hair" in region:
+        return ["secondary", "texture", "shading"]
+    if region in {"face_outline", "jaw_cheek"}:
+        return ["contour", "secondary", "shading"]
+    return ["secondary", "texture", "shading"]
 
 
 
@@ -435,6 +566,108 @@ def apply_art_director_to_order(strokes: list[Stroke], plan: dict[str, object]) 
         except (TypeError, ValueError):
             pass
     strokes.sort(key=lambda s: (s.order_score, s.region, s.start_ms))
+
+
+def apply_section_guidance(strokes: list[Stroke], subject: str, settings: RenderSettings, plan: dict[str, object]) -> bool:
+    sequence = plan.get("section_sequence") if plan else None
+    if not isinstance(sequence, list) or not sequence:
+        return False
+
+    region_rules: dict[str, dict[str, object]] = {}
+    for idx, raw in enumerate(sequence):
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "")).strip()
+        if not region:
+            continue
+        region_rules[region] = {
+            "order": safe_float(raw.get("order"), idx),
+            "mode": str(raw.get("mode", "complete")),
+            "direction": str(raw.get("direction", "auto")),
+            "shading_direction": str(raw.get("shading_direction", raw.get("direction", "auto"))),
+        }
+    if not region_rules:
+        return False
+
+    layer_phase = {
+        "layout": -0.20,
+        "key": 0.00,
+        "contour": 0.10,
+        "secondary": 0.24,
+        "texture": 0.42,
+        "shading": 0.58,
+        "accent": 0.78,
+    }
+    late_shading_base = (len(region_rules) + 1) * 1000
+    for stroke in strokes:
+        rule = region_rules.get(stroke.region)
+        if not rule:
+            stroke.order_score += len(region_rules) * 1000 + region_order_key(stroke.region, subject)[0] * 30
+            continue
+        mode = str(rule.get("mode", "complete"))
+        if mode == "skip":
+            stroke.opacity = 0
+            stroke.order_score = late_shading_base + 900
+            continue
+
+        order = safe_float(rule.get("order"), 0)
+        phase = layer_phase.get(stroke.layer, 0.5)
+        if mode == "lines_first" and stroke.layer in {"texture", "shading", "smudge"}:
+            base = late_shading_base + order * 90
+        elif mode == "shading_only" and stroke.layer not in {"texture", "shading", "smudge"}:
+            base = late_shading_base + order * 90 + 40
+        else:
+            base = order * 1000
+        stroke.order_score = base + phase * 100 + stroke.bbox[1] * 0.01 + stroke.bbox[0] * 0.002
+
+        direction = str(rule.get("shading_direction" if stroke.layer in {"texture", "shading"} else "direction", "auto"))
+        orient_stroke_for_direction(stroke, direction, settings)
+
+    strokes.sort(key=lambda s: (s.order_score, s.region, s.bbox[1], s.bbox[0]))
+    for region in region_rules:
+        indices = [idx for idx, stroke in enumerate(strokes) if stroke.region == region and stroke.opacity > 0]
+        if len(indices) < 3:
+            continue
+        ordered = order_strokes_continuously([strokes[idx] for idx in indices], max_jump=min(settings.width, settings.height) * 0.16)
+        for idx, stroke in zip(indices, ordered):
+            strokes[idx] = stroke
+    return True
+
+
+def safe_float(value: object, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def orient_stroke_for_direction(stroke: Stroke, direction: str, settings: RenderSettings) -> None:
+    if direction in {"", "auto"} or len(stroke.points) < 2:
+        return
+    start = stroke.points[0]
+    end = stroke.points[-1]
+    should_reverse = False
+    if direction == "left_to_right":
+        should_reverse = start[0] > end[0]
+    elif direction == "right_to_left":
+        should_reverse = start[0] < end[0]
+    elif direction == "top_to_bottom":
+        should_reverse = start[1] > end[1]
+    elif direction == "bottom_to_top":
+        should_reverse = start[1] < end[1]
+    elif direction == "center_out":
+        cx, cy = settings.width / 2, settings.height / 2
+        should_reverse = point_distance(end, (cx, cy)) < point_distance(start, (cx, cy))
+    elif direction == "outside_in":
+        cx, cy = settings.width / 2, settings.height / 2
+        should_reverse = point_distance(end, (cx, cy)) > point_distance(start, (cx, cy))
+    if should_reverse:
+        stroke.points = list(reversed(stroke.points))
+
+
+def point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
 
 def create_layout_strokes(darkness: np.ndarray, subject: str, settings: RenderSettings, rng: random.Random, semantic_regions: list[SemanticRegion] | None = None) -> list[Stroke]:
     h, w = darkness.shape

@@ -358,7 +358,10 @@ def professional_render_strokes(strokes: list[Stroke], settings: RenderSettings)
     """Use only artist-guiding strokes when target reveal supplies final graphite."""
     if not strokes:
         return strokes
+    guided_sections = '"section_sequence"' in getattr(settings, "art_director_json", "")
     allowed_layers = {"contour", "key", "secondary", "accent"}
+    if guided_sections:
+        allowed_layers.add("shading")
     filtered = [
         stroke for stroke in strokes
         if stroke.effect == "draw"

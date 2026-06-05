@@ -12,6 +12,8 @@ const videoOutput = $('videoOutput');
 const quickPreviewBtn = $('quickPreviewBtn');
 const cleanupOutputsBtn = $('cleanupOutputsBtn');
 const cleanupStatus = $('cleanupStatus');
+const sectionPlanner = $('sectionPlanner');
+const applySectionGuideBtn = $('applySectionGuideBtn');
 const motionPreviewCanvas = $('motionPreviewCanvas');
 const sourcePreview = $('sourcePreview');
 const sketchPreview = $('sketchPreview');
@@ -70,6 +72,7 @@ let lastArtDirectorAnalysis = null;
 let lastPreviewPlan = null;
 let lastSketchPreviewSrc = '';
 let quickPreviewAnimation = null;
+let sectionDragState = null;
 const filePreviewUrls = new Map();
 
 const fields = [
@@ -122,6 +125,31 @@ applyArtDirectorBtn.addEventListener('click', () => applyLastArtDirectorRecommen
 sketchierPresetBtn.addEventListener('click', () => applySketchierPreset());
 sketchInputPresetBtn.addEventListener('click', () => applySketchInputPreset());
 portraitSequenceBtn.addEventListener('click', () => applyPortraitArtistSequence());
+applySectionGuideBtn.addEventListener('click', () => {
+  if (syncSectionGuideToJson(true)) log('Applied section guide. Generate preview again or render to use this order.');
+});
+sectionPlanner.addEventListener('click', (event) => {
+  const action = event.target?.dataset?.sectionAction;
+  if (action === 'portrait-parts') {
+    usePortraitParts();
+    return;
+  }
+  if (action === 'separate-boxes') {
+    separateSectionBoxes();
+    return;
+  }
+  const target = event.target.closest?.('[data-region]');
+  if (target) selectSectionRegion(target.dataset.region);
+});
+sectionPlanner.addEventListener('input', (event) => {
+  if (event.target?.dataset?.sectionField) updateSectionOverlayFromRows();
+});
+sectionPlanner.addEventListener('change', (event) => {
+  if (event.target?.dataset?.sectionField) updateSectionOverlayFromRows();
+});
+sectionPlanner.addEventListener('pointerdown', (event) => startSectionDrag(event));
+window.addEventListener('pointermove', (event) => updateSectionDrag(event));
+window.addEventListener('pointerup', () => endSectionDrag());
 ['hand_tip_x','hand_tip_y','hand_scale','hand_rotation','hand_opacity'].forEach(id => $(id)?.addEventListener('input', updateCalibrationOverlay));
 
 const dropZone = $('dropZone');
@@ -307,6 +335,19 @@ function applySketchInputPreset() {
 function applyPortraitArtistSequence() {
   const plan = {
     subject_type: 'portrait',
+    section_sequence: [
+      { region: 'left_eye', order: 1, mode: 'complete', direction: 'center_out', shading_direction: 'left_to_right' },
+      { region: 'right_eye', order: 2, mode: 'complete', direction: 'center_out', shading_direction: 'left_to_right' },
+      { region: 'left_eyebrow', order: 3, mode: 'complete', direction: 'left_to_right', shading_direction: 'left_to_right' },
+      { region: 'right_eyebrow', order: 4, mode: 'complete', direction: 'left_to_right', shading_direction: 'left_to_right' },
+      { region: 'mouth', order: 5, mode: 'complete', direction: 'center_out', shading_direction: 'left_to_right' },
+      { region: 'nose', order: 6, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'top_to_bottom' },
+      { region: 'face_outline', order: 7, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'top_to_bottom' },
+      { region: 'jaw_cheek', order: 8, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'top_to_bottom' },
+      { region: 'hair_top', order: 9, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'top_to_bottom' },
+      { region: 'hair_side', order: 10, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'top_to_bottom' },
+      { region: 'neck_clothing', order: 11, mode: 'complete', direction: 'top_to_bottom', shading_direction: 'left_to_right' }
+    ],
     artist_sequence: [
       'eyes',
       'eyebrows',
@@ -361,6 +402,456 @@ function applyPortraitArtistSequence() {
     target_reveal_strength: 90
   });
   log('Applied portrait artist sequence: eyes, eyebrows, lips, nose, face cut, hair, then shading.');
+}
+
+function renderSectionPlanner(regions, subjectType = 'auto') {
+  if (!sectionPlanner) return;
+  if (!regions.length) {
+    sectionPlanner.className = 'section-planner empty';
+    sectionPlanner.textContent = 'Generate sketch preview to review and guide drawing sections.';
+    return;
+  }
+  const ordered = [...regions]
+    .filter(region => region?.name && region.name !== 'overall_subject' && region.name !== 'background')
+    .sort((a, b) => defaultRegionOrder(a.name, subjectType) - defaultRegionOrder(b.name, subjectType) || a.name.localeCompare(b.name))
+    .slice(0, 14);
+  if (!ordered.length) {
+    sectionPlanner.className = 'section-planner empty';
+    sectionPlanner.textContent = 'No editable drawing sections were detected.';
+    return;
+  }
+  const settings = lastPreviewPlan?.settings || {};
+  const canvasWidth = Number(settings.width || 720);
+  const canvasHeight = Number(settings.height || 1280);
+  const imageSrc = lastSketchPreviewSrc || sourcePreview?.src || '';
+  sectionPlanner.className = 'section-planner';
+  sectionPlanner.innerHTML = `
+    <div class="section-planner-head">
+      <strong>Editable drawing guide</strong>
+      <span>Click a colored area to edit it. Area fields are X, Y, W, H percentages of the image.</span>
+      <div class="section-map-actions">
+        <button type="button" data-section-action="portrait-parts">Use portrait parts</button>
+        <button type="button" data-section-action="separate-boxes">Separate boxes</button>
+      </div>
+    </div>
+    <div class="section-map">
+      ${imageSrc ? `<img src="${imageSrc}" alt="Section map" />` : ''}
+      <svg viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="xMidYMid meet" aria-label="Editable section overlay">
+        ${ordered.map((region, idx) => sectionOverlayHtml(region, idx + 1)).join('')}
+      </svg>
+    </div>
+    <div class="section-grid">
+      ${ordered.map((region, idx) => sectionRowHtml(region, idx + 1, subjectType, canvasWidth, canvasHeight)).join('')}
+    </div>
+  `;
+  selectSectionRegion(ordered[0]?.name);
+}
+
+function sectionOverlayHtml(region, order) {
+  const [x1, y1, x2, y2] = region.bbox || [0, 0, 1, 1];
+  const name = escapeHtml(region.name);
+  const label = escapeHtml(region.name.replaceAll('_', ' '));
+  const w = Math.max(1, x2 - x1);
+  const h = Math.max(1, y2 - y1);
+  return `
+    <g class="section-box" data-region="${name}">
+      <rect class="section-box-body" x="${x1}" y="${y1}" width="${w}" height="${h}"></rect>
+      <polygon class="section-polygon-body hidden"></polygon>
+      <text x="${x1 + 8}" y="${y1 + 22}" data-label="${label}">${order}. ${label}</text>
+      <rect class="resize-handle nw" data-handle="nw" x="${x1 - 7}" y="${y1 - 7}" width="14" height="14"></rect>
+      <rect class="resize-handle ne" data-handle="ne" x="${x1 + w - 7}" y="${y1 - 7}" width="14" height="14"></rect>
+      <rect class="resize-handle sw" data-handle="sw" x="${x1 - 7}" y="${y1 + h - 7}" width="14" height="14"></rect>
+      <rect class="resize-handle se" data-handle="se" x="${x1 + w - 7}" y="${y1 + h - 7}" width="14" height="14"></rect>
+    </g>
+  `;
+}
+
+function sectionRowHtml(region, order, subjectType, canvasWidth, canvasHeight) {
+  const name = escapeHtml(region.name);
+  const label = escapeHtml(region.name.replaceAll('_', ' '));
+  const direction = defaultRegionDirection(region.name, subjectType);
+  const shade = defaultShadingDirection(region.name, subjectType);
+  const area = bboxToPercent(region.bbox || [0, 0, canvasWidth, canvasHeight], canvasWidth, canvasHeight);
+  return `
+    <div class="section-row" data-region="${name}">
+      <input type="number" min="1" max="99" value="${order}" data-section-field="order" aria-label="Section order for ${label}" />
+      <div class="section-name">
+        <strong>${label}</strong>
+        <span>${escapeHtml(region.role || 'section')} · ${(Number(region.confidence || 0) * 100).toFixed(0)}%</span>
+      </div>
+      <select data-section-field="mode" aria-label="Completion mode for ${label}">
+        <option value="complete" selected>Complete before next</option>
+        <option value="lines_first">Lines first, shade later</option>
+        <option value="shading_only">Shading pass only</option>
+        <option value="skip">Skip</option>
+      </select>
+      <select data-section-field="shape" aria-label="Part shape for ${label}">
+        <option value="rectangle" selected>Rectangle</option>
+        <option value="freeform">Freeform mask</option>
+      </select>
+      <div class="section-area" aria-label="Area for ${label}">
+        <input type="number" min="0" max="100" step="0.5" value="${area.x}" data-section-field="x" title="X %" />
+        <input type="number" min="0" max="100" step="0.5" value="${area.y}" data-section-field="y" title="Y %" />
+        <input type="number" min="1" max="100" step="0.5" value="${area.w}" data-section-field="w" title="Width %" />
+        <input type="number" min="1" max="100" step="0.5" value="${area.h}" data-section-field="h" title="Height %" />
+        <input type="number" min="-180" max="180" step="1" value="0" data-section-field="rotation" title="Rotation degrees" />
+      </div>
+      <select data-section-field="direction" aria-label="Stroke direction for ${label}">
+        ${directionOptions(direction)}
+      </select>
+      <select data-section-field="shading_direction" aria-label="Shading direction for ${label}">
+        ${directionOptions(shade)}
+      </select>
+    </div>
+  `;
+}
+
+function bboxToPercent(bbox, canvasWidth, canvasHeight) {
+  const [x1, y1, x2, y2] = bbox.map(Number);
+  return {
+    x: roundOne(x1 / canvasWidth * 100),
+    y: roundOne(y1 / canvasHeight * 100),
+    w: roundOne(Math.max(1, x2 - x1) / canvasWidth * 100),
+    h: roundOne(Math.max(1, y2 - y1) / canvasHeight * 100)
+  };
+}
+
+function roundOne(value) {
+  return Math.round(value * 10) / 10;
+}
+
+function selectSectionRegion(region, scrollRow = true) {
+  if (!region || !sectionPlanner) return;
+  sectionPlanner.querySelectorAll('[data-region]').forEach(el => {
+    el.classList.toggle('selected', el.dataset.region === region);
+  });
+  const row = sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(region)}"]`);
+  if (scrollRow) row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function updateSectionOverlayFromRows() {
+  const settings = lastPreviewPlan?.settings || {};
+  const canvasWidth = Number(settings.width || 720);
+  const canvasHeight = Number(settings.height || 1280);
+  const rows = Array.from(sectionPlanner?.querySelectorAll('.section-row') || []);
+  for (const row of rows) {
+    const region = row.dataset.region;
+    const group = sectionPlanner.querySelector(`.section-box[data-region="${CSS.escape(region)}"]`);
+    if (!group) continue;
+    const area = readSectionArea(row);
+    const shape = row.querySelector('[data-section-field="shape"]')?.value || 'rectangle';
+    const rotation = Number(row.querySelector('[data-section-field="rotation"]')?.value || 0);
+    const x = area.x / 100 * canvasWidth;
+    const y = area.y / 100 * canvasHeight;
+    const w = area.w / 100 * canvasWidth;
+    const h = area.h / 100 * canvasHeight;
+    const rect = group.querySelector('.section-box-body');
+    const polygon = group.querySelector('.section-polygon-body');
+    const text = group.querySelector('text');
+    const order = row.querySelector('[data-section-field="order"]')?.value || '';
+    const points = sectionPolygonPoints(area, shape, rotation);
+    const pixelPoints = points.map(([px, py]) => [px / 100 * canvasWidth, py / 100 * canvasHeight]);
+    if (shape === 'rectangle' && Math.abs(rotation) < 0.1) {
+      rect?.classList.remove('hidden');
+      polygon?.classList.add('hidden');
+      rect?.setAttribute('x', x);
+      rect?.setAttribute('y', y);
+      rect?.setAttribute('width', Math.max(1, w));
+      rect?.setAttribute('height', Math.max(1, h));
+      rect?.removeAttribute('transform');
+    } else {
+      rect?.classList.add('hidden');
+      polygon?.classList.remove('hidden');
+      polygon?.setAttribute('points', pixelPoints.map(([px, py]) => `${roundOne(px)},${roundOne(py)}`).join(' '));
+    }
+    text?.setAttribute('x', x + 8);
+    text?.setAttribute('y', y + 22);
+    if (text) text.textContent = `${order}. ${text.dataset.label || region.replaceAll('_', ' ')}`;
+    positionSectionHandles(group, x, y, Math.max(1, w), Math.max(1, h));
+  }
+}
+
+function positionSectionHandles(group, x, y, w, h) {
+  const positions = {
+    nw: [x - 7, y - 7],
+    ne: [x + w - 7, y - 7],
+    sw: [x - 7, y + h - 7],
+    se: [x + w - 7, y + h - 7]
+  };
+  for (const [handle, [hx, hy]] of Object.entries(positions)) {
+    const node = group.querySelector(`.resize-handle.${handle}`);
+    node?.setAttribute('x', hx);
+    node?.setAttribute('y', hy);
+  }
+}
+
+function readSectionArea(row) {
+  const field = name => Number(row.querySelector(`[data-section-field="${name}"]`)?.value || 0);
+  const x = Math.max(0, Math.min(99, field('x')));
+  const y = Math.max(0, Math.min(99, field('y')));
+  const w = Math.max(1, Math.min(100 - x, field('w') || 1));
+  const h = Math.max(1, Math.min(100 - y, field('h') || 1));
+  return { x, y, w, h };
+}
+
+function setSectionArea(row, area) {
+  const x = Math.max(0, Math.min(99, area.x));
+  const y = Math.max(0, Math.min(99, area.y));
+  const w = Math.max(1, Math.min(100 - x, area.w));
+  const h = Math.max(1, Math.min(100 - y, area.h));
+  const values = { x, y, w, h };
+  for (const [name, value] of Object.entries(values)) {
+    const input = row.querySelector(`[data-section-field="${name}"]`);
+    if (input) input.value = roundOne(value);
+  }
+}
+
+function sectionPolygonPoints(area, shape, rotation = 0) {
+  const cx = area.x + area.w / 2;
+  const cy = area.y + area.h / 2;
+  const base = shape === 'freeform'
+    ? [
+        [area.x + area.w * 0.10, area.y + area.h * 0.34],
+        [area.x + area.w * 0.24, area.y + area.h * 0.08],
+        [area.x + area.w * 0.58, area.y + area.h * 0.02],
+        [area.x + area.w * 0.90, area.y + area.h * 0.20],
+        [area.x + area.w * 0.96, area.y + area.h * 0.62],
+        [area.x + area.w * 0.72, area.y + area.h * 0.95],
+        [area.x + area.w * 0.30, area.y + area.h * 0.92],
+        [area.x + area.w * 0.04, area.y + area.h * 0.68]
+      ]
+    : [
+        [area.x, area.y],
+        [area.x + area.w, area.y],
+        [area.x + area.w, area.y + area.h],
+        [area.x, area.y + area.h]
+      ];
+  return base.map(([x, y]) => rotatePointPct(x, y, cx, cy, rotation));
+}
+
+function rotatePointPct(x, y, cx, cy, degrees) {
+  const radians = degrees * Math.PI / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const dx = x - cx;
+  const dy = y - cy;
+  return [roundOne(cx + dx * cos - dy * sin), roundOne(cy + dx * sin + dy * cos)];
+}
+
+function startSectionDrag(event) {
+  const group = event.target.closest?.('.section-box');
+  if (!group || !sectionPlanner.contains(group)) return;
+  const svg = group.ownerSVGElement;
+  const row = sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(group.dataset.region)}"]`);
+  if (!svg || !row) return;
+  event.preventDefault();
+  selectSectionRegion(group.dataset.region, false);
+  const start = sectionSvgPoint(svg, event);
+  sectionDragState = {
+    svg,
+    row,
+    region: group.dataset.region,
+    handle: event.target.dataset.handle || 'move',
+    start,
+    area: readSectionArea(row)
+  };
+  document.body.classList.add('section-dragging');
+  event.target.setPointerCapture?.(event.pointerId);
+}
+
+function updateSectionDrag(event) {
+  if (!sectionDragState) return;
+  event.preventDefault();
+  const { svg, row, handle, start, area } = sectionDragState;
+  const settings = lastPreviewPlan?.settings || {};
+  const canvasWidth = Number(settings.width || 720);
+  const canvasHeight = Number(settings.height || 1280);
+  const point = sectionSvgPoint(svg, event);
+  const dx = (point.x - start.x) / canvasWidth * 100;
+  const dy = (point.y - start.y) / canvasHeight * 100;
+  const next = { ...area };
+  if (handle === 'move') {
+    next.x = area.x + dx;
+    next.y = area.y + dy;
+  } else {
+    if (handle.includes('w')) {
+      next.x = area.x + dx;
+      next.w = area.w - dx;
+    }
+    if (handle.includes('e')) next.w = area.w + dx;
+    if (handle.includes('n')) {
+      next.y = area.y + dy;
+      next.h = area.h - dy;
+    }
+    if (handle.includes('s')) next.h = area.h + dy;
+  }
+  setSectionArea(row, next);
+  updateSectionOverlayFromRows();
+}
+
+function endSectionDrag() {
+  sectionDragState = null;
+  document.body.classList.remove('section-dragging');
+}
+
+function sectionSvgPoint(svg, event) {
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const mapped = point.matrixTransform(svg.getScreenCTM().inverse());
+  return { x: mapped.x, y: mapped.y };
+}
+
+function usePortraitParts() {
+  const settings = lastPreviewPlan?.settings || {};
+  const canvasWidth = Number(settings.width || 720);
+  const canvasHeight = Number(settings.height || 1280);
+  const parts = [
+    ['left_eye', 'focal', 1, [30, 35, 18, 10], 'center_out'],
+    ['right_eye', 'focal', 2, [54, 35, 18, 10], 'center_out'],
+    ['left_eyebrow', 'focal', 3, [28, 29, 20, 8], 'left_to_right'],
+    ['right_eyebrow', 'focal', 4, [53, 29, 20, 8], 'left_to_right'],
+    ['mouth', 'focal', 5, [38, 56, 25, 11], 'center_out'],
+    ['nose', 'focal', 6, [43, 41, 14, 18], 'top_to_bottom'],
+    ['face_outline', 'form', 7, [25, 22, 50, 48], 'top_to_bottom'],
+    ['hair_top', 'support', 8, [18, 8, 64, 23], 'top_to_bottom'],
+    ['hair_side', 'support', 9, [15, 30, 70, 43], 'top_to_bottom'],
+    ['neck_clothing', 'support', 10, [30, 70, 40, 22], 'top_to_bottom']
+  ];
+  const regions = parts.map(([name, role, order, pct]) => {
+    const [x, y, w, h] = pct;
+    return {
+      name,
+      role,
+      confidence: 0.96,
+      bbox: [x / 100 * canvasWidth, y / 100 * canvasHeight, (x + w) / 100 * canvasWidth, (y + h) / 100 * canvasHeight]
+    };
+  });
+  $('subject_type').value = 'portrait';
+  renderSectionPlanner(regions, 'portrait');
+  sectionPlanner.querySelectorAll('.section-row').forEach((row, idx) => {
+    row.querySelector('[data-section-field="order"]').value = parts[idx][2];
+    row.querySelector('[data-section-field="direction"]').value = parts[idx][4];
+    row.querySelector('[data-section-field="shading_direction"]').value = defaultShadingDirection(row.dataset.region, 'portrait');
+    if (row.dataset.region.includes('hair')) row.querySelector('[data-section-field="shape"]').value = 'freeform';
+  });
+  updateSectionOverlayFromRows();
+  syncSectionGuideToJson(false);
+  log('Created editable portrait parts. Drag or resize boxes, then apply the section guide.');
+}
+
+function separateSectionBoxes() {
+  const rows = Array.from(sectionPlanner?.querySelectorAll('.section-row') || []);
+  if (!rows.length) return;
+  rows.sort((a, b) => Number(a.querySelector('[data-section-field="order"]').value) - Number(b.querySelector('[data-section-field="order"]').value));
+  rows.forEach((row, idx) => {
+    const area = readSectionArea(row);
+    const col = idx % 2;
+    const band = Math.floor(idx / 2);
+    const next = {
+      x: col ? 52 : 8,
+      y: Math.min(88, 6 + band * 16),
+      w: Math.min(40, Math.max(18, area.w)),
+      h: Math.min(14, Math.max(8, area.h))
+    };
+    setSectionArea(row, next);
+  });
+  updateSectionOverlayFromRows();
+  syncSectionGuideToJson(false);
+  log('Separated section boxes into a clean editable layout. Adjust each part over the image as needed.');
+}
+
+function directionOptions(selected) {
+  const rows = [
+    ['auto', 'Auto direction'],
+    ['left_to_right', 'Left to right'],
+    ['right_to_left', 'Right to left'],
+    ['top_to_bottom', 'Top to bottom'],
+    ['bottom_to_top', 'Bottom to top'],
+    ['center_out', 'Center outward'],
+    ['outside_in', 'Outside inward']
+  ];
+  return rows.map(([value, label]) => `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`).join('');
+}
+
+function defaultRegionOrder(region, subjectType) {
+  if (subjectType === 'portrait') {
+    const order = {
+      left_eye: 1, right_eye: 2, left_eyebrow: 3, right_eyebrow: 4,
+      mouth: 5, nose: 6, face_outline: 7, jaw_cheek: 8,
+      hair_top: 9, hair_side: 10, neck_clothing: 11
+    };
+    return order[region] || 50;
+  }
+  if (subjectType === 'architecture') {
+    const order = { roof: 1, central_structure: 2, entrance: 3, left_pillars: 4, right_pillars: 5, carvings: 6, ground: 7 };
+    return order[region] || 50;
+  }
+  return 50;
+}
+
+function defaultRegionDirection(region, subjectType) {
+  if (subjectType === 'portrait') {
+    if (region.includes('eye') || region === 'mouth') return 'center_out';
+    if (region.includes('hair') || region.includes('face') || region.includes('jaw') || region === 'nose') return 'top_to_bottom';
+  }
+  if (subjectType === 'architecture' && (region.includes('roof') || region.includes('ground'))) return 'left_to_right';
+  return 'auto';
+}
+
+function defaultShadingDirection(region, subjectType) {
+  if (subjectType === 'portrait' && region.includes('hair')) return 'top_to_bottom';
+  if (subjectType === 'portrait') return 'left_to_right';
+  return defaultRegionDirection(region, subjectType);
+}
+
+function syncSectionGuideToJson(showErrors = false) {
+  const rows = Array.from(sectionPlanner?.querySelectorAll('.section-row') || []);
+  if (!rows.length) return false;
+  let plan = {};
+  try {
+    const raw = $('art_director_json').value.trim();
+    plan = raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    if (showErrors) log('Art Director JSON is not valid. Fix it or clear it before applying the section guide.');
+    return false;
+  }
+  const subject = lastPreviewPlan?.subject_type || $('subject_type').value || 'auto';
+  plan.subject_type = subject === 'auto' ? plan.subject_type || 'portrait' : subject;
+  plan.section_sequence = rows.map(row => {
+    const field = name => row.querySelector(`[data-section-field="${name}"]`)?.value || '';
+    const area = readSectionArea(row);
+    const shape = field('shape') || 'rectangle';
+    const rotation = Number(field('rotation')) || 0;
+    const settings = lastPreviewPlan?.settings || {};
+    const canvasWidth = Number(settings.width || 720);
+    const canvasHeight = Number(settings.height || 1280);
+    const polygonPct = sectionPolygonPoints(area, shape, rotation);
+    const bbox = [
+      area.x / 100 * canvasWidth,
+      area.y / 100 * canvasHeight,
+      (area.x + area.w) / 100 * canvasWidth,
+      (area.y + area.h) / 100 * canvasHeight
+    ].map(value => Math.round(value * 10) / 10);
+    const section = {
+      region: row.dataset.region,
+      order: Number(field('order')) || 99,
+      mode: field('mode') || 'complete',
+      shape,
+      rotation,
+      direction: field('direction') || 'auto',
+      shading_direction: field('shading_direction') || 'auto',
+      bbox_pct: [area.x, area.y, area.w, area.h],
+      bbox
+    };
+    if (shape !== 'rectangle' || Math.abs(rotation) > 0.1) section.polygon_pct = polygonPct;
+    return section;
+  }).sort((a, b) => a.order - b.order);
+  plan.region_priority = Object.fromEntries(plan.section_sequence.map((row, idx) => [row.region, idx * 10 - 100]));
+  plan.artist_sequence = plan.artist_sequence || true;
+  $('planning_mode').value = 'art_director_json';
+  $('art_director_json').value = JSON.stringify(plan, null, 2);
+  return true;
 }
 
 function applyLastArtDirectorRecommendations() {
@@ -680,6 +1171,7 @@ function resetSketchPreview() {
   if (sketchPreviewEmpty) sketchPreviewEmpty.classList.remove('hidden');
   lastPreviewPlan = null;
   lastSketchPreviewSrc = '';
+  renderSectionPlanner([], 'auto');
   stopQuickMotionPreview();
   if (quickPreviewBtn) quickPreviewBtn.disabled = true;
 }
@@ -718,6 +1210,7 @@ function previewFile(file, img) {
 function buildFormData(includeHand = false) {
   const file = imageInput.files?.[0];
   if (!file) throw new Error('Please choose an image or sketch first.');
+  syncSectionGuideToJson(false);
   const fd = new FormData();
   fd.append('file', file);
   for (const id of fields) {
@@ -1016,6 +1509,7 @@ analyzeBtn.addEventListener('click', async () => {
     showSketchPreview(data.sketch_preview);
     renderPassSummary(data.plan.pass_summary || []);
     renderSemanticSummary(data.plan.semantic_regions || [], data.plan.layer_plan || []);
+    renderSectionPlanner(data.plan.semantic_regions || [], data.plan.subject_type || $('subject_type').value);
     log(`Sketch preview ready: ${data.plan.stroke_count} strokes, subject ${data.plan.subject_type}`, data.plan.warnings || []);
   } catch (err) {
     log(err.message || String(err));
