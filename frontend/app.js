@@ -9,8 +9,12 @@ const progressBar = $('progressBar');
 const progressText = $('progressText');
 const downloadLinks = $('downloadLinks');
 const videoOutput = $('videoOutput');
+const quickPreviewBtn = $('quickPreviewBtn');
+const motionPreviewCanvas = $('motionPreviewCanvas');
 const sourcePreview = $('sourcePreview');
 const sketchPreview = $('sketchPreview');
+const sketchPreviewEmpty = $('sketchPreviewEmpty');
+const videoOutputEmpty = $('videoOutputEmpty');
 const passSummary = $('passSummary');
 const semanticSummary = $('semanticSummary');
 const healthBox = $('healthBox');
@@ -53,17 +57,23 @@ const timelineArtDirectorBtn = $('timelineArtDirectorBtn');
 const applyArtDirectorBtn = $('applyArtDirectorBtn');
 const qualitySummary = $('qualitySummary');
 const artDirectorRecommendations = $('artDirectorRecommendations');
+const sketchierPresetBtn = $('sketchierPresetBtn');
+const sketchInputPresetBtn = $('sketchInputPresetBtn');
+const portraitSequenceBtn = $('portraitSequenceBtn');
 
 let timelineScenes = [];
 let timelinePreviewIndex = 0;
 let timelinePreviewTimer = null;
 let lastArtDirectorAnalysis = null;
+let lastPreviewPlan = null;
+let lastSketchPreviewSrc = '';
+let quickPreviewAnimation = null;
 const filePreviewUrls = new Map();
 
 const fields = [
   'input_type', 'subject_type', 'style_type', 'ratio', 'render_quality', 'sketch_strength', 'stroke_density',
   'human_randomness', 'duration_seconds', 'fps', 'max_strokes', 'paper_texture',
-  'construction_pass', 'accent_pass', 'hand_overlay', 'pencil_audio', 'ambient_track', 'ambient_level', 'drawing_audio_level', 'transition_sfx', 'transition_sfx_level', 'seed', 'trace_mode',
+  'construction_pass', 'accent_pass', 'target_reveal', 'target_reveal_strength', 'hand_overlay', 'pencil_audio', 'ambient_track', 'ambient_level', 'drawing_audio_level', 'transition_sfx', 'transition_sfx_level', 'seed', 'trace_mode',
   'stroke_extraction_mode', 'planning_mode', 'art_director_json', 'camera_motion', 'camera_move_preset',
   'camera_zoom_start', 'camera_zoom_end', 'camera_pan_start_x', 'camera_pan_start_y', 'camera_pan_end_x', 'camera_pan_end_y',
   'smudge_pass', 'eraser_pass', 'title_card_text', 'watermark_text', 'hand_mode', 'hand_preset', 'hand_side', 'hand_asset_filename',
@@ -73,14 +83,21 @@ const fields = [
   'motion_blur_strength'
 ];
 
-['sketch_strength','stroke_density','human_randomness','graphite_grain','charcoal_dust','ink_bleed','marker_overlap','stroke_taper','motion_blur_strength','drawing_audio_level','ambient_level','transition_sfx_level','camera_zoom_start','camera_zoom_end','camera_pan_start_x','camera_pan_start_y','camera_pan_end_x','camera_pan_end_y','hand_scale','hand_opacity','hand_shadow_strength','contact_correction_strength','contact_position_smoothing','reposition_arc_strength'].forEach(id => {
+['sketch_strength','stroke_density','human_randomness','target_reveal_strength','graphite_grain','charcoal_dust','ink_bleed','marker_overlap','stroke_taper','motion_blur_strength','drawing_audio_level','ambient_level','transition_sfx_level','camera_zoom_start','camera_zoom_end','camera_pan_start_x','camera_pan_start_y','camera_pan_end_x','camera_pan_end_y','hand_scale','hand_opacity','hand_shadow_strength','contact_correction_strength','contact_position_smoothing','reposition_arc_strength'].forEach(id => {
   const input = $(id);
   const label = $(`${id}_val`);
   if (input && label) input.addEventListener('input', () => label.textContent = input.value);
 });
 
-imageInput.addEventListener('change', () => previewFile(imageInput.files?.[0], sourcePreview));
-handAsset.addEventListener('change', () => { handAssetFilename.value=''; loadHandCalibrationAsset(handAsset.files?.[0]); });
+imageInput.addEventListener('change', () => {
+  previewFile(imageInput.files?.[0], sourcePreview);
+  resetSketchPreview();
+});
+handAsset.addEventListener('change', () => {
+  handAssetFilename.value='';
+  loadHandCalibrationAsset(handAsset.files?.[0]);
+  assetLibraryStatus.textContent = 'New hand selected. It will be saved to the library after auto-detect or render.';
+});
 handAssetFilename.addEventListener('change', () => loadLibraryAssetPreview());
 applyPresetBtn.addEventListener('click', () => applyCurrentPreset());
 refreshAssetsBtn.addEventListener('click', () => { loadHandAssets(); loadHandPresets(); });
@@ -94,10 +111,14 @@ buildTimelineBtn.addEventListener('click', () => buildTimelineFromSelectedFiles(
 syncTimelineBtn.addEventListener('click', () => syncEditorFromTimelineJson());
 playTimelinePreviewBtn.addEventListener('click', () => toggleStoryboardPreview());
 renderTimelineBtn.addEventListener('click', () => renderTimelineQueued());
+quickPreviewBtn.addEventListener('click', () => toggleQuickMotionPreview());
 cameraMovePreset.addEventListener('change', () => applyCameraPreset());
 artDirectorBtn.addEventListener('click', () => analyzeCurrentImageWithArtDirector());
 timelineArtDirectorBtn.addEventListener('click', () => analyzeTimelineWithArtDirector());
 applyArtDirectorBtn.addEventListener('click', () => applyLastArtDirectorRecommendations());
+sketchierPresetBtn.addEventListener('click', () => applySketchierPreset());
+sketchInputPresetBtn.addEventListener('click', () => applySketchInputPreset());
+portraitSequenceBtn.addEventListener('click', () => applyPortraitArtistSequence());
 ['hand_tip_x','hand_tip_y','hand_scale','hand_rotation','hand_opacity'].forEach(id => $(id)?.addEventListener('input', updateCalibrationOverlay));
 
 const dropZone = $('dropZone');
@@ -108,6 +129,7 @@ dropZone.addEventListener('drop', (e) => {
   if (!file) return;
   imageInput.files = e.dataTransfer.files;
   previewFile(file, sourcePreview);
+  resetSketchPreview();
 });
 
 function applyCameraPreset() {
@@ -228,6 +250,114 @@ function setIfExists(id, value) {
 function applyRecommendedSettings(settings = {}) {
   for (const [key, value] of Object.entries(settings)) setIfExists(key, value);
   updateCalibrationOverlay();
+}
+
+function applySketchierPreset() {
+  applyRecommendedSettings({
+    input_type: 'photo',
+    style_type: 'pencil',
+    render_quality: 'preview',
+    trace_mode: 'opencv',
+    stroke_extraction_mode: 'hybrid',
+    sketch_strength: 90,
+    stroke_density: 88,
+    human_randomness: 16,
+    max_strokes: 5200,
+    graphite_grain: 78,
+    stroke_taper: 68,
+    motion_blur_strength: 8,
+    construction_pass: true,
+    accent_pass: true,
+    smudge_pass: true,
+    eraser_pass: true,
+    target_reveal: true,
+    target_reveal_strength: 78,
+    camera_motion: true,
+  });
+  log('Applied sketchier render settings. Click Generate sketch preview to inspect the stroke plan before rendering.');
+}
+
+function applySketchInputPreset() {
+  applyRecommendedSettings({
+    input_type: 'sketch',
+    style_type: 'pencil',
+    render_quality: 'preview',
+    trace_mode: 'opencv',
+    stroke_extraction_mode: 'hybrid',
+    sketch_strength: 68,
+    stroke_density: 76,
+    human_randomness: 10,
+    max_strokes: 6200,
+    graphite_grain: 72,
+    stroke_taper: 64,
+    motion_blur_strength: 6,
+    construction_pass: true,
+    accent_pass: true,
+    smudge_pass: true,
+    eraser_pass: false,
+    target_reveal: true,
+    target_reveal_strength: 92,
+  });
+  log('Using uploaded sketch directly. Click Generate sketch preview; it should stay close to the uploaded drawing.');
+}
+
+function applyPortraitArtistSequence() {
+  const plan = {
+    subject_type: 'portrait',
+    artist_sequence: [
+      'eyes',
+      'eyebrows',
+      'lips',
+      'nose',
+      'face cut',
+      'hair',
+      'shading and soft graphite'
+    ],
+    region_priority: {
+      left_eye: -96,
+      right_eye: -95,
+      left_eyebrow: -88,
+      right_eyebrow: -87,
+      mouth: -76,
+      nose: -66,
+      face_outline: -52,
+      jaw_cheek: -48,
+      hair_top: -20,
+      hair_side: -16,
+      neck_clothing: 8,
+      background: 26
+    },
+    region_layer_overrides: {
+      left_eye: 'key',
+      right_eye: 'key',
+      left_eyebrow: 'key',
+      right_eyebrow: 'key',
+      mouth: 'key',
+      nose: 'key',
+      face_outline: 'contour',
+      hair_top: 'secondary',
+      hair_side: 'secondary'
+    },
+    layer_notes: {
+      layout: 'Only light guide marks before facial features.',
+      key: 'Draw eyes first, then eyebrows, lips, and nose.',
+      contour: 'Draw face cut after focal features.',
+      secondary: 'Build hair with longer grouped strokes.',
+      shading: 'Finish with soft graphite shading where needed.',
+      accent: 'Use final accents sparingly for pupils, lash line, lips, and darkest hair.'
+    }
+  };
+  applyRecommendedSettings({
+    subject_type: 'portrait',
+    planning_mode: 'art_director_json',
+    art_director_json: JSON.stringify(plan, null, 2),
+    human_randomness: 8,
+    stroke_density: 78,
+    max_strokes: 6200,
+    target_reveal: true,
+    target_reveal_strength: 90
+  });
+  log('Applied portrait artist sequence: eyes, eyebrows, lips, nose, face cut, hair, then shading.');
 }
 
 function applyLastArtDirectorRecommendations() {
@@ -539,6 +669,42 @@ async function renderTimelineQueued() {
   }
 }
 
+function resetSketchPreview() {
+  if (sketchPreview) {
+    sketchPreview.removeAttribute('src');
+    sketchPreview.classList.add('hidden', 'placeholder');
+  }
+  if (sketchPreviewEmpty) sketchPreviewEmpty.classList.remove('hidden');
+  lastPreviewPlan = null;
+  lastSketchPreviewSrc = '';
+  stopQuickMotionPreview();
+  if (quickPreviewBtn) quickPreviewBtn.disabled = true;
+}
+
+function showSketchPreview(src) {
+  if (!sketchPreview || !src) return;
+  sketchPreview.src = src;
+  sketchPreview.classList.remove('hidden', 'placeholder');
+  if (sketchPreviewEmpty) sketchPreviewEmpty.classList.add('hidden');
+}
+
+function resetRenderedVideo() {
+  if (videoOutput) {
+    videoOutput.removeAttribute('src');
+    videoOutput.classList.add('hidden');
+  }
+  if (motionPreviewCanvas) motionPreviewCanvas.classList.add('hidden');
+  if (videoOutputEmpty) videoOutputEmpty.classList.remove('hidden');
+}
+
+function showRenderedVideo(src) {
+  if (!videoOutput || !src) return;
+  if (motionPreviewCanvas) motionPreviewCanvas.classList.add('hidden');
+  videoOutput.src = src;
+  videoOutput.classList.remove('hidden');
+  if (videoOutputEmpty) videoOutputEmpty.classList.add('hidden');
+}
+
 function previewFile(file, img) {
   if (!file) return;
   const reader = new FileReader();
@@ -634,11 +800,21 @@ async function loadHandPresets() {
 
 async function loadHandAssets() {
   try {
+    const previous = handAssetFilename.value;
     const res = await fetch('/api/assets/hand');
     const data = await res.json();
     const assets = data.assets || [];
     handAssetFilename.innerHTML = '<option value="">Use uploaded asset only</option>' + assets.map(a => `<option value="${a.filename}">${a.filename} (${a.type})</option>`).join('');
-    assetLibraryStatus.textContent = assets.length ? `Library: ${assets.length} saved hand asset(s).` : 'Library empty. Upload an asset to create one.';
+    const keepPrevious = previous && assets.some(a => a.filename === previous);
+    if (keepPrevious) {
+      handAssetFilename.value = previous;
+    } else if (assets.length) {
+      handAssetFilename.value = assets[0].filename;
+      loadLibraryAssetPreview();
+    }
+    assetLibraryStatus.textContent = assets.length
+      ? `Using saved hand: ${handAssetFilename.value || assets[0].filename}. Library has ${assets.length} asset(s).`
+      : 'Library empty. Upload a hand asset once; it will be saved for future runs.';
   } catch (err) {
     assetLibraryStatus.textContent = 'Could not load hand asset library.';
   }
@@ -704,6 +880,7 @@ async function autoDetectTip() {
     if (data.asset_name && !handAssetFilename.value) {
       await loadHandAssets();
       handAssetFilename.value = data.asset_name;
+      loadLibraryAssetPreview();
     }
   } catch (err) {
     log(err.message || String(err));
@@ -826,15 +1003,17 @@ applyCameraPreset();
 analyzeBtn.addEventListener('click', async () => {
   try {
     setBusy(true);
-    log('Analyzing stroke plan…');
+    log('Generating sketch preview and stroke plan…');
     const res = await fetch('/api/analyze', { method: 'POST', body: buildFormData(false) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Analyze failed');
-    sketchPreview.src = data.sketch_preview;
-    sketchPreview.classList.remove('placeholder');
+    lastPreviewPlan = data.plan;
+    lastSketchPreviewSrc = data.sketch_preview;
+    if (quickPreviewBtn) quickPreviewBtn.disabled = false;
+    showSketchPreview(data.sketch_preview);
     renderPassSummary(data.plan.pass_summary || []);
     renderSemanticSummary(data.plan.semantic_regions || [], data.plan.layer_plan || []);
-    log(`Plan ready: ${data.plan.stroke_count} strokes, subject ${data.plan.subject_type}`, data.plan.warnings || []);
+    log(`Sketch preview ready: ${data.plan.stroke_count} strokes, subject ${data.plan.subject_type}`, data.plan.warnings || []);
   } catch (err) {
     log(err.message || String(err));
   } finally {
@@ -846,7 +1025,7 @@ renderBtn.addEventListener('click', async () => {
   try {
     setBusy(true);
     downloadLinks.innerHTML = '';
-    videoOutput.classList.add('hidden');
+    resetRenderedVideo();
     progressWrap.classList.remove('hidden');
     progressBar.style.width = '0%';
     progressText.textContent = 'Uploading and queueing render…';
@@ -895,9 +1074,245 @@ function handleRenderResult(result) {
     downloadLinks.appendChild(a);
   }
   if (files.mp4) {
-    videoOutput.src = files.mp4;
-    videoOutput.classList.remove('hidden');
+    showRenderedVideo(files.mp4);
   }
+  if (handAsset.files?.[0]) {
+    handAsset.value = '';
+    loadHandAssets();
+  }
+}
+
+function stopQuickMotionPreview() {
+  if (quickPreviewAnimation) {
+    cancelAnimationFrame(quickPreviewAnimation);
+    quickPreviewAnimation = null;
+  }
+  if (quickPreviewBtn) quickPreviewBtn.textContent = 'Play quick motion preview';
+}
+
+async function toggleQuickMotionPreview() {
+  if (quickPreviewAnimation) {
+    stopQuickMotionPreview();
+    return;
+  }
+  if (!lastPreviewPlan?.strokes?.length || !lastSketchPreviewSrc) {
+    log('Generate sketch preview first, then play the quick motion preview.');
+    return;
+  }
+  try {
+    const targetImage = await loadImage(lastSketchPreviewSrc);
+    playQuickMotionPreview(lastPreviewPlan, targetImage);
+  } catch (err) {
+    log(err.message || String(err));
+  }
+}
+
+function playQuickMotionPreview(plan, targetImage) {
+  const canvas = motionPreviewCanvas;
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const settings = plan.settings || {};
+  const width = Number(settings.width || targetImage.naturalWidth || 720);
+  const height = Number(settings.height || targetImage.naturalHeight || 1280);
+  canvas.width = width;
+  canvas.height = height;
+  canvas.classList.remove('hidden');
+  if (videoOutput) videoOutput.classList.add('hidden');
+  if (videoOutputEmpty) videoOutputEmpty.classList.add('hidden');
+  if (quickPreviewBtn) quickPreviewBtn.textContent = 'Stop quick motion preview';
+
+  const strokes = plan.strokes || [];
+  const durationMs = Math.max(
+    Number(settings.duration_seconds || 0) * 1000,
+    ...strokes.map(stroke => Number(stroke.end_ms || 0)),
+    1000,
+  );
+  const previewMs = Math.min(9000, Math.max(4500, durationMs * 0.42));
+  const targetReveal = $('target_reveal')?.checked || settings.target_reveal || settings.input_type === 'sketch';
+  const revealStrength = Math.max(0, Math.min(1, Number($('target_reveal_strength')?.value || settings.target_reveal_strength || 85) / 100));
+  const startedAt = performance.now();
+
+  const draw = (now) => {
+    const elapsed = now - startedAt;
+    const p = Math.min(1, elapsed / previewMs);
+    const t = p * durationMs;
+    drawQuickPreviewFrame(ctx, width, height, strokes, targetImage, t, p, targetReveal, revealStrength);
+    if (p < 1) {
+      quickPreviewAnimation = requestAnimationFrame(draw);
+    } else {
+      stopQuickMotionPreview();
+    }
+  };
+  quickPreviewAnimation = requestAnimationFrame(draw);
+  log('Playing quick browser preview. Full render still controls final hand, audio, camera, and MP4 quality.');
+}
+
+function drawQuickPreviewFrame(ctx, width, height, strokes, targetImage, t, p, targetReveal, revealStrength) {
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#f2ebdb';
+  ctx.fillRect(0, 0, width, height);
+
+  if (targetReveal) {
+    drawQuickTargetReveal(ctx, width, height, strokes, targetImage, t, p, revealStrength);
+  }
+
+  for (const stroke of strokes) {
+    const start = Number(stroke.start_ms || 0);
+    const end = Number(stroke.end_ms || start + stroke.duration_ms || start + 1);
+    if (t < start) break;
+    const progress = t >= end ? 1 : (t - start) / Math.max(1, end - start);
+    drawQuickStroke(ctx, stroke, progress, targetReveal);
+  }
+}
+
+function drawQuickTargetReveal(ctx, width, height, strokes, targetImage, t, p, revealStrength) {
+  const mask = document.createElement('canvas');
+  mask.width = width;
+  mask.height = height;
+  const maskCtx = mask.getContext('2d');
+  maskCtx.clearRect(0, 0, width, height);
+  maskCtx.lineCap = 'round';
+  maskCtx.lineJoin = 'round';
+
+  for (const stroke of strokes) {
+    const start = Number(stroke.start_ms || 0);
+    const end = Number(stroke.end_ms || start + stroke.duration_ms || start + 1);
+    if (t < start) break;
+    const progress = t >= end ? 1 : (t - start) / Math.max(1, end - start);
+    drawQuickRevealStroke(maskCtx, stroke, progress);
+  }
+
+  const softened = document.createElement('canvas');
+  softened.width = width;
+  softened.height = height;
+  const softCtx = softened.getContext('2d');
+  softCtx.filter = `blur(${Math.round(7 + revealStrength * 10)}px)`;
+  softCtx.drawImage(mask, 0, 0);
+  softCtx.filter = 'none';
+  softCtx.globalCompositeOperation = 'lighter';
+  softCtx.globalAlpha = 0.62;
+  softCtx.drawImage(mask, 0, 0);
+
+  const catchUp = smoothstep(Math.max(0, Math.min(1, (p - 0.74) / 0.26)));
+  if (catchUp > 0) {
+    softCtx.globalCompositeOperation = 'source-over';
+    softCtx.globalAlpha = catchUp * revealStrength;
+    softCtx.fillStyle = '#fff';
+    softCtx.fillRect(0, 0, width, height);
+  }
+
+  const revealed = document.createElement('canvas');
+  revealed.width = width;
+  revealed.height = height;
+  const revealCtx = revealed.getContext('2d');
+  revealCtx.drawImage(targetImage, 0, 0, width, height);
+  revealCtx.globalCompositeOperation = 'destination-in';
+  revealCtx.drawImage(softened, 0, 0);
+
+  ctx.save();
+  ctx.globalAlpha = Math.min(1, 0.88 + revealStrength * 0.12);
+  ctx.drawImage(revealed, 0, 0);
+  ctx.restore();
+}
+
+function drawQuickRevealStroke(ctx, stroke, progress) {
+  const points = partialStrokePoints(stroke.points || [], progress);
+  if (points.length < 2 || stroke.effect === 'erase') return;
+  const layer = stroke.layer || '';
+  const thickness = Math.max(1, Number(stroke.thickness || 1.2));
+  const width = layer === 'shading' || layer === 'texture' || stroke.effect === 'smudge'
+    ? Math.max(24, thickness * 14)
+    : Math.max(12, thickness * 9);
+  ctx.save();
+  ctx.globalAlpha = layer === 'shading' || layer === 'texture' ? 0.7 : 0.95;
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  traceSmoothPath(ctx, points);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawQuickStroke(ctx, stroke, progress, targetReveal = false) {
+  const points = partialStrokePoints(stroke.points || [], progress);
+  if (points.length < 2) return;
+  const effect = stroke.effect || 'draw';
+  if (effect === 'erase') return;
+  const layer = stroke.layer || '';
+  const opacity = Math.max(0.08, Math.min(0.82, Number(stroke.opacity || 0.55)));
+  const thickness = Math.max(1, Number(stroke.thickness || 1.2));
+  const alphaBase = targetReveal ? 0.24 : 0.68;
+  const alpha = effect === 'smudge' || layer === 'shading' ? opacity * 0.18 : opacity * alphaBase;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = `rgba(35, 33, 30, ${alpha})`;
+  ctx.lineWidth = effect === 'smudge' ? thickness * 3.2 : Math.max(0.7, thickness * (targetReveal ? 0.72 : 1));
+  ctx.beginPath();
+  traceSmoothPath(ctx, points);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function traceSmoothPath(ctx, points) {
+  ctx.moveTo(points[0][0], points[0][1]);
+  if (points.length === 2) {
+    ctx.lineTo(points[1][0], points[1][1]);
+    return;
+  }
+  for (let i = 1; i < points.length - 1; i++) {
+    const midX = (points[i][0] + points[i + 1][0]) / 2;
+    const midY = (points[i][1] + points[i + 1][1]) / 2;
+    ctx.quadraticCurveTo(points[i][0], points[i][1], midX, midY);
+  }
+  const last = points[points.length - 1];
+  ctx.lineTo(last[0], last[1]);
+}
+
+function smoothstep(value) {
+  const x = Math.max(0, Math.min(1, value));
+  return x * x * (3 - 2 * x);
+}
+
+function partialStrokePoints(points, progress) {
+  if (!points.length) return [];
+  if (progress >= 1) return points;
+  const lengths = [];
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    const dx = points[i][0] - points[i - 1][0];
+    const dy = points[i][1] - points[i - 1][1];
+    const len = Math.hypot(dx, dy);
+    lengths.push(len);
+    total += len;
+  }
+  const target = total * Math.max(0, Math.min(1, progress));
+  const out = [points[0]];
+  let walked = 0;
+  for (let i = 1; i < points.length; i++) {
+    const len = lengths[i - 1];
+    if (walked + len <= target) {
+      out.push(points[i]);
+      walked += len;
+      continue;
+    }
+    const u = len <= 0 ? 0 : (target - walked) / len;
+    out.push([
+      points[i - 1][0] + (points[i][0] - points[i - 1][0]) * u,
+      points[i - 1][1] + (points[i][1] - points[i - 1][1]) * u,
+    ]);
+    break;
+  }
+  return out;
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not load sketch preview image for quick motion preview.'));
+    img.src = src;
+  });
 }
 
 function renderPassSummary(rows) {

@@ -9,16 +9,30 @@
 <body>
   <header class="hero">
     <div>
-      <p class="eyebrow">Batch 14 AI Art Director + Quality Scoring</p>
+      <p class="eyebrow">Professional sketch-video workflow</p>
       <h1>AI Street Sketch Video Studio</h1>
-      <p class="subtitle">Turn one or many final images/sketches into realistic street-artist drawing videos with AI-ready Art Director analysis, quality scoring, automatic subject/style suggestions, editable planning JSON, visual timeline editing, storyboard preview, multi-layer audio design, cinematic camera moves, realistic hand overlay support, and MP4 export.</p>
+      <p class="subtitle">Upload a finished image, let the studio plan the artist strokes, tune the realism, then render a realistic street-artist drawing video.</p>
+      <ol class="workflow-map" aria-label="Sketch video creation steps">
+        <li><span>1</span>Upload</li>
+        <li><span>2</span>Analyze</li>
+        <li><span>3</span>Tune</li>
+        <li><span>4</span>Hand</li>
+        <li><span>5</span>Render</li>
+      </ol>
     </div>
     <div class="health" id="healthBox">Checking backend…</div>
   </header>
 
   <main class="app-shell">
     <section class="panel controls">
-      <h2>0. User profiles</h2>
+      <div class="panel-intro">
+        <p class="eyebrow">Setup</p>
+        <h2>Create a sketch video</h2>
+        <p>Follow the sections from top to bottom. Most advanced controls already have good defaults, so a first render only needs an image, style choices, and the render button.</p>
+      </div>
+
+      <h2>Optional: save your setup</h2>
+      <p class="step-note">Profiles store your usual style, hand overlay, camera, and branding choices for the next video.</p>
       <div class="grid two">
         <label>Saved profile
           <select id="profile_select"><option value="">Select saved profile…</option></select>
@@ -36,15 +50,17 @@
         <button type="button" id="saveProfileBtn">Save current settings</button>
         <button type="button" id="deleteProfileBtn">Delete profile</button>
       </div>
-      <h2>1. Input</h2>
+
+      <h2>Step 1: Add source artwork</h2>
+      <p class="step-note">Choose the final photo or sketch the street artist should recreate. A clear image with strong edges usually produces the best stroke plan.</p>
       <label class="drop-zone" id="dropZone">
         <input type="file" id="imageInput" accept="image/*" />
-        <span>Drop or choose final image / sketch</span>
+        <span>Drop your image here or choose a file</span>
       </label>
       <img id="sourcePreview" class="preview hidden" alt="Source preview" />
 
       <details class="advanced" open>
-        <summary>AI Art Director + quality scoring</summary>
+        <summary>Step 2: Analyze quality and get recommendations</summary>
         <p>Analyze the uploaded image or timeline scenes before rendering. This local analysis creates quality warnings, subject/style suggestions, render-setting recommendations, captions, and editable Art Director JSON.</p>
         <div class="mini-actions">
           <button type="button" id="artDirectorBtn">Analyze current image</button>
@@ -55,8 +71,8 @@
         <div id="artDirectorRecommendations" class="art-director-report empty">No Art Director report yet.</div>
       </details>
 
-      <details class="advanced" open>
-        <summary>Multi-scene timeline</summary>
+      <details class="advanced">
+        <summary>Optional: build a multi-scene timeline</summary>
         <p>Upload multiple finished images or sketches, build a timeline JSON, and render one stitched sketching video across many scenes.</p>
         <div class="grid two">
           <label>Timeline project name
@@ -107,6 +123,11 @@
         </label>
       </details>
 
+      <h2>Step 3: Choose the video style</h2>
+      <p class="step-note">Pick what the source is, what kind of subject it contains, and the final format for the video.</p>
+      <div class="helper-actions">
+        <button type="button" id="sketchInputPresetBtn">Use uploaded sketch directly</button>
+      </div>
       <div class="grid two">
         <label>Input type
           <select id="input_type"><option value="photo">Photo → sketch</option><option value="sketch">Already a sketch</option></select>
@@ -123,11 +144,15 @@
           <select id="ratio"><option value="9:16">9:16 Shorts</option><option value="1:1">1:1 Square</option><option value="16:9">16:9 YouTube</option></select>
         </label>
         <label>Render quality
-          <select id="render_quality"><option value="preview">Preview (fast)</option><option value="standard" selected>Standard HD</option><option value="final">Final 1080p</option><option value="ultra">Ultra 1440p/2K</option></select>
+          <select id="render_quality"><option value="preview" selected>Preview (fast)</option><option value="standard">Standard HD</option><option value="final">Final 1080p</option><option value="ultra">Ultra 1440p/2K</option></select>
         </label>
       </div>
 
-      <h2>2. Artist planning</h2>
+      <h2>Step 4: Plan the artist strokes</h2>
+      <p class="step-note">These settings decide how the drawing is decomposed into construction lines, key features, shading, and finishing accents.</p>
+      <div class="helper-actions">
+        <button type="button" id="portraitSequenceBtn">Use portrait artist sequence</button>
+      </div>
       <div class="grid two">
         <label>Trace mode
           <select id="trace_mode"><option value="opencv">OpenCV strokes</option><option value="auto">Auto SVG sidecar</option><option value="potrace">Potrace sidecar</option><option value="vtracer">VTracer sidecar</option></select>
@@ -159,19 +184,23 @@
 }</textarea>
       </details>
 
-      <h2>3. Realism settings</h2>
+      <h2>Step 5: Tune realism</h2>
+      <p class="step-note">Control how bold, dense, human, and tactile the drawing feels. Start with the defaults, then adjust after the first preview.</p>
+      <div class="helper-actions">
+        <button type="button" id="sketchierPresetBtn">Use sketchier render settings</button>
+      </div>
       <div class="grid two">
-        <label>Sketch strength <span id="sketch_strength_val">70</span>
-          <input type="range" id="sketch_strength" min="20" max="100" value="70" />
+        <label>Sketch strength <span id="sketch_strength_val">86</span>
+          <input type="range" id="sketch_strength" min="20" max="100" value="86" />
         </label>
-        <label>Stroke density <span id="stroke_density_val">60</span>
-          <input type="range" id="stroke_density" min="10" max="100" value="60" />
+        <label>Stroke density <span id="stroke_density_val">82</span>
+          <input type="range" id="stroke_density" min="10" max="100" value="82" />
         </label>
         <label>Human randomness <span id="human_randomness_val">35</span>
           <input type="range" id="human_randomness" min="0" max="100" value="35" />
         </label>
         <label>Max strokes
-          <input type="number" id="max_strokes" min="250" max="12000" value="1800" />
+          <input type="number" id="max_strokes" min="250" max="12000" value="4200" />
         </label>
         <label>Duration seconds
           <input type="number" id="duration_seconds" min="5" max="240" value="18" />
@@ -186,11 +215,15 @@
         <label><input type="checkbox" id="accent_pass" checked /> Final accent pass</label>
         <label><input type="checkbox" id="smudge_pass" checked /> Smudge pass</label>
         <label><input type="checkbox" id="eraser_pass" /> Eraser highlight pass</label>
+        <label><input type="checkbox" id="target_reveal" /> Progressive target reveal</label>
         <label><input type="checkbox" id="camera_motion" checked /> Subtle camera motion</label>
         <label><input type="checkbox" id="pencil_audio" checked /> Pencil scratch audio</label>
       </div>
+      <label>Target reveal strength <span id="target_reveal_strength_val">85</span>
+        <input type="range" id="target_reveal_strength" min="0" max="100" value="85" />
+      </label>
 
-      <details class="advanced" open>
+      <details class="advanced">
         <summary>Advanced brush simulation</summary>
         <div class="grid two">
           <label>Graphite grain <span id="graphite_grain_val">65</span>
@@ -214,7 +247,7 @@
         </div>
       </details>
 
-            <details class="advanced" open>
+      <details class="advanced">
         <summary>Audio design</summary>
         <div class="grid two">
           <label>Ambient track
@@ -240,7 +273,7 @@
         </div>
       </details>
 
-      <details class="advanced" open>
+      <details class="advanced">
         <summary>Camera moves and framing</summary>
         <div class="grid two">
           <label>Camera move preset
@@ -280,7 +313,8 @@
         </div>
       </details>
 
-      <h2>4. Hand overlay</h2>
+      <h2>Step 6: Add the drawing hand</h2>
+      <p class="step-note">Use the procedural hand for quick tests, or upload a transparent hand asset and calibrate the pencil tip for more realistic contact.</p>
       <div class="grid two">
         <label>Hand preset
           <select id="hand_preset"><option value="">Load preset…</option></select>
@@ -338,7 +372,7 @@
         </label>
       </div>
 
-      <details class="advanced" open>
+      <details class="advanced">
         <summary>Pencil-tip calibration</summary>
         <p>Upload your transparent hand image/video, then click exactly where the pencil tip touches the paper. The X/Y percentages will update automatically.</p>
         <div class="calibration-box" id="calibrationBox">
@@ -367,7 +401,8 @@
         </div>
       </details>
 
-      <h2>5. Branding</h2>
+      <h2>Step 7: Brand and render</h2>
+      <p class="step-note">Add optional title and watermark text, then analyze the stroke plan or render the final MP4.</p>
       <div class="grid two">
         <label>Opening title
           <input type="text" id="title_card_text" maxlength="140" placeholder="Watch this street sketch come alive" />
@@ -381,16 +416,32 @@
       </div>
 
       <div class="actions">
-        <button id="analyzeBtn">Analyze stroke plan</button>
+        <button id="analyzeBtn">Generate sketch preview</button>
         <button id="renderBtn" class="primary">Render MP4 with queue</button>
       </div>
     </section>
 
     <section class="panel output">
-      <h2>Preview & output</h2>
+      <div class="panel-intro output-intro">
+        <p class="eyebrow">Preview</p>
+        <h2>Review the result</h2>
+        <p>Analysis, video progress, download links, artist passes, semantic regions, and logs appear here as you work through the steps.</p>
+      </div>
+      <div class="preview-tools">
+        <button type="button" id="quickPreviewBtn" disabled>Play quick motion preview</button>
+      </div>
       <div class="previews">
-        <div><h3>Sketch preview</h3><img id="sketchPreview" class="preview placeholder" alt="Sketch preview" /></div>
-        <div><h3>Rendered video</h3><video id="videoOutput" controls class="video hidden"></video></div>
+        <div class="preview-slot">
+          <h3>Sketch preview</h3>
+          <div class="preview-empty" id="sketchPreviewEmpty">Click Generate sketch preview after choosing an image.</div>
+          <img id="sketchPreview" class="preview placeholder hidden" alt="Sketch preview" />
+        </div>
+        <div class="preview-slot">
+          <h3>Rendered video</h3>
+          <div class="preview-empty" id="videoOutputEmpty">Rendered MP4 appears here after the queue finishes.</div>
+          <canvas id="motionPreviewCanvas" class="motion-preview hidden"></canvas>
+          <video id="videoOutput" controls class="video hidden"></video>
+        </div>
       </div>
       <div class="progress-wrap hidden" id="progressWrap">
         <div class="progress"><div id="progressBar"></div></div>

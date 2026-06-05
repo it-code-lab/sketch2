@@ -51,6 +51,8 @@ class RenderSettings:
     camera_pan_end_y: int = 0
     smudge_pass: bool = True
     eraser_pass: bool = False
+    target_reveal: bool = False
+    target_reveal_strength: int = 85
     title_card_text: str = ""
     watermark_text: str = ""
 
@@ -141,6 +143,8 @@ class RenderSettings:
             camera_pan_end_y=i("camera_pan_end_y", 0, -100, 100),
             smudge_pass=b("smudge_pass", True),
             eraser_pass=b("eraser_pass", False),
+            target_reveal=b("target_reveal", False),
+            target_reveal_strength=i("target_reveal_strength", 85, 0, 100),
             title_card_text=s("title_card_text", "")[:140],
             watermark_text=s("watermark_text", "")[:80],
             hand_mode=s("hand_mode", "procedural"),

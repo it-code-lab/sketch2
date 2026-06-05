@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import os
 import random
@@ -160,7 +160,7 @@ def render_plan_to_mp4(
             warnings.extend(hand_video_overlay.warnings)
 
     background = create_paper_background(settings.width, settings.height, settings.paper_texture, settings.seed, settings)
-    render_frames(plan.strokes, background, settings, frames_dir, total_frames, progress_callback=progress, hand_video_overlay=hand_video_overlay)
+    render_frames(plan.strokes, background, settings, frames_dir, total_frames, progress_callback=progress, hand_video_overlay=hand_video_overlay, target_sketch=sketch_preview)
 
     progress(82, "Saving preview and stroke plan")
     sketch_preview.save(preview_path)
@@ -257,11 +257,23 @@ def render_plan_to_mp4(
     }
 
 
-def render_frames(strokes: list[Stroke], background: Image.Image, settings: RenderSettings, frames_dir: Path, total_frames: int, progress_callback: Callable[[float, str], None] | None = None, hand_video_overlay: HandVideoOverlay | None = None) -> None:
+def render_frames(
+    strokes: list[Stroke],
+    background: Image.Image,
+    settings: RenderSettings,
+    frames_dir: Path,
+    total_frames: int,
+    progress_callback: Callable[[float, str], None] | None = None,
+    hand_video_overlay: HandVideoOverlay | None = None,
+    target_sketch: Image.Image | None = None,
+) -> None:
     frames_dir.mkdir(parents=True, exist_ok=True)
     duration_ms = settings.duration_seconds * 1000
     # Drawing all strokes from scratch per frame is expensive, so cache completed strokes onto a base image.
     completed = background.copy().convert("RGBA")
+    target_reveal = prepare_target_reveal(target_sketch, background.size, settings)
+    reveal_mask = Image.new("L", background.size, 0) if target_reveal is not None else None
+    render_strokes = professional_render_strokes(strokes, settings) if target_reveal is not None else strokes
     last_completed_index = -1
     hand_tip_smoothed: tuple[float, float] | None = None
     hand_angle_smoothed: float | None = None
@@ -273,23 +285,42 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
         frame = completed.copy()
 
         # Draw newly completed strokes only once onto the completed layer.
-        while last_completed_index + 1 < len(strokes) and strokes[last_completed_index + 1].end_ms < t:
+        while last_completed_index + 1 < len(render_strokes) and render_strokes[last_completed_index + 1].end_ms < t:
             last_completed_index += 1
-            draw_stroke(completed, strokes[last_completed_index], settings, progress=1.0)
+            if target_reveal is None:
+                draw_stroke(completed, render_strokes[last_completed_index], settings, progress=1.0)
+            else:
+                draw_subtle_guide_stroke(completed, render_strokes[last_completed_index], settings, progress=1.0)
+            if reveal_mask is not None:
+                draw_reveal_stroke(reveal_mask, render_strokes[last_completed_index], settings, progress=1.0)
 
         active_state: dict[str, object] | None = None
-        for idx in range(last_completed_index + 1, len(strokes)):
-            stroke = strokes[idx]
+        active_stroke: Stroke | None = None
+        active_progress = 0.0
+        for idx in range(last_completed_index + 1, len(render_strokes)):
+            stroke = render_strokes[idx]
             if stroke.start_ms <= t <= stroke.end_ms:
                 progress = (t - stroke.start_ms) / max(1, stroke.duration_ms)
+                active_stroke = stroke
+                active_progress = progress
                 tip, heading = contact_tip_and_heading(stroke.points, progress, settings)
                 active_state = {"tip": tip, "heading": heading, "contact": True, "lift": 0.0, "progress": progress}
-                draw_stroke(frame, stroke, settings, progress=progress)
+                if target_reveal is None:
+                    draw_stroke(frame, stroke, settings, progress=progress)
+                else:
+                    draw_subtle_guide_stroke(frame, stroke, settings, progress=progress)
             elif stroke.start_ms > t:
                 break
 
+        if target_reveal is not None and reveal_mask is not None:
+            frame_mask = reveal_mask
+            if active_stroke is not None:
+                frame_mask = reveal_mask.copy()
+                draw_reveal_stroke(frame_mask, active_stroke, settings, progress=active_progress)
+            apply_target_reveal(frame, target_reveal, frame_mask, frame_idx, total_frames, settings)
+
         if active_state is None:
-            active_state = reposition_hand_state(strokes, last_completed_index, t, settings)
+            active_state = reposition_hand_state(render_strokes, last_completed_index, t, settings)
 
         if settings.hand_overlay and active_state is not None:
             desired_tip = active_state["tip"]  # type: ignore[assignment]
@@ -321,6 +352,138 @@ def render_frames(strokes: list[Stroke], background: Image.Image, settings: Rend
         apply_frame_motion_blur(frame, settings, frame_idx, total_frames)
         apply_camera_motion_and_labels(frame, settings, frame_idx, total_frames)
         frame.convert("RGB").save(frames_dir / f"frame_{frame_idx:05d}.png", optimize=False)
+
+
+def professional_render_strokes(strokes: list[Stroke], settings: RenderSettings) -> list[Stroke]:
+    """Use only artist-guiding strokes when target reveal supplies final graphite."""
+    if not strokes:
+        return strokes
+    allowed_layers = {"contour", "key", "secondary", "accent"}
+    filtered = [
+        stroke for stroke in strokes
+        if stroke.effect == "draw"
+        and stroke.layer in allowed_layers
+        and stroke.length >= 14
+        and stroke.darkness >= 0.045
+    ]
+    if not filtered:
+        filtered = [stroke for stroke in strokes if stroke.effect == "draw" and stroke.length >= 14]
+    max_count = max(80, min(len(filtered), int(getattr(settings, "max_strokes", 1800) * 0.18)))
+    def importance(stroke: Stroke) -> float:
+        layer_bonus = {"key": 3.0, "contour": 2.5, "secondary": 1.8, "accent": 1.4, "layout": 0.8}.get(stroke.layer, 1.0)
+        return stroke.darkness * 2.2 + min(1.0, stroke.length / 220.0) + layer_bonus
+    selected = [replace(stroke, points=list(stroke.points)) for stroke in sorted(filtered, key=importance, reverse=True)[:max_count]]
+    selected.sort(key=lambda stroke: (stroke.start_ms, stroke.order_score, stroke.region))
+    remap_timing(selected, settings.duration_seconds * 1000)
+    return selected
+
+
+def remap_timing(strokes: list[Stroke], duration_ms: int) -> None:
+    if not strokes:
+        return
+    total_units = sum(max(20.0, stroke.length * max(0.35, stroke.speed)) for stroke in strokes)
+    t = 0
+    for stroke in strokes:
+        units = max(20.0, stroke.length * max(0.35, stroke.speed))
+        dur = max(45, int(duration_ms * units / max(1.0, total_units)))
+        stroke.start_ms = t
+        stroke.duration_ms = dur
+        stroke.end_ms = t + dur
+        t = stroke.end_ms
+
+
+def prepare_target_reveal(target_sketch: Image.Image | None, size: tuple[int, int], settings: RenderSettings) -> Image.Image | None:
+    if not getattr(settings, "target_reveal", False) or target_sketch is None:
+        return None
+    target = target_sketch.convert("L")
+    if target.size != size:
+        target = target.resize(size, Image.LANCZOS)
+    arr = np.array(target, dtype=np.uint8)
+    darkness = (255 - arr).astype(np.float32)
+    darkness[darkness < 5] = 0
+    strength = max(0.0, min(1.0, getattr(settings, "target_reveal_strength", 85) / 100.0))
+    alpha = np.clip(darkness * (0.72 + strength * 0.45), 0, 245).astype(np.uint8)
+    rgba = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
+    rgba[..., 0] = arr
+    rgba[..., 1] = arr
+    rgba[..., 2] = arr
+    rgba[..., 3] = alpha
+    return Image.fromarray(rgba, "RGBA")
+
+
+def draw_subtle_guide_stroke(image: Image.Image, stroke: Stroke, settings: RenderSettings, progress: float) -> None:
+    if len(stroke.points) < 2 or progress <= 0:
+        return
+    points = partial_polyline(stroke.points, min(1.0, max(0.0, progress)))
+    if len(points) < 2:
+        return
+    min_x = min(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+    max_x = max(p[0] for p in points)
+    max_y = max(p[1] for p in points)
+    pad = int(max(16, stroke.thickness * 5 + 12))
+    x0 = max(0, int(math.floor(min_x)) - pad)
+    y0 = max(0, int(math.floor(min_y)) - pad)
+    x1 = min(image.width, int(math.ceil(max_x)) + pad)
+    y1 = min(image.height, int(math.ceil(max_y)) + pad)
+    if x1 <= x0 or y1 <= y0:
+        return
+    local_points = [(x - x0, y - y0) for x, y in points]
+    layer = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer, "RGBA")
+    alpha = int(95 * min(1.0, max(0.18, stroke.opacity)))
+    width = max(1, int(round(stroke.thickness * 0.62)))
+    draw_variable_width_line(
+        draw,
+        local_points,
+        STYLE_COLORS.get(settings.style_type, STYLE_COLORS["pencil"]) + (alpha,),
+        width,
+        0.08,
+        random.Random(hash((stroke.id, settings.seed, "guide")) & 0xFFFFFFFF),
+        0.55,
+    )
+    if stroke.layer in {"layout", "secondary"}:
+        layer = layer.filter(ImageFilter.GaussianBlur(radius=0.35))
+    image.alpha_composite(layer, (x0, y0))
+
+
+def draw_reveal_stroke(mask: Image.Image, stroke: Stroke, settings: RenderSettings, progress: float) -> None:
+    if len(stroke.points) < 2 or progress <= 0:
+        return
+    points = partial_polyline(stroke.points, min(1.0, max(0.0, progress)))
+    if len(points) < 2:
+        return
+    draw = ImageDraw.Draw(mask)
+    width = max(8, int(round(stroke.thickness * 7 + 10)))
+    if stroke.layer in {"shading", "texture"}:
+        width = max(width, 18)
+    if stroke.effect == "erase":
+        return
+    draw.line(points, fill=255, width=width, joint="curve")
+    if stroke.layer in {"shading", "texture", "smudge"} or stroke.effect == "smudge":
+        draw.line(points, fill=210, width=width + 18, joint="curve")
+
+
+def apply_target_reveal(frame: Image.Image, target_reveal: Image.Image, local_mask: Image.Image, frame_idx: int, total_frames: int, settings: RenderSettings) -> None:
+    progress = 1.0 if total_frames <= 1 else frame_idx / max(1, total_frames - 1)
+    strength = max(0.0, min(1.0, getattr(settings, "target_reveal_strength", 85) / 100.0))
+    soft_mask = local_mask.filter(ImageFilter.GaussianBlur(radius=8 + strength * 10))
+    mask_arr = np.array(soft_mask, dtype=np.float32) / 255.0
+
+    # A gentle catch-up near the end guarantees the last frame contains target
+    # details that the extracted stroke set may have missed.
+    catch_up = max(0.0, min(1.0, (progress - 0.78) / 0.22))
+    catch_up = catch_up * catch_up * (3 - 2 * catch_up)
+    ambient_reveal = (progress ** 1.7) * 0.16 * strength
+    reveal = np.maximum(mask_arr, catch_up)
+    reveal = np.maximum(reveal, ambient_reveal)
+
+    target_arr = np.array(target_reveal, dtype=np.uint8)
+    target_alpha = target_arr[..., 3].astype(np.float32) / 255.0
+    final_alpha = np.clip(target_alpha * reveal * (0.62 + strength * 0.45), 0, 1)
+    overlay = target_arr.copy()
+    overlay[..., 3] = np.clip(final_alpha * 255, 0, 255).astype(np.uint8)
+    frame.alpha_composite(Image.fromarray(overlay, "RGBA"))
 
 
 

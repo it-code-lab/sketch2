@@ -83,50 +83,162 @@ def pil_to_cv_gray(image: Image.Image) -> np.ndarray:
 
 
 def create_sketch_map(image: Image.Image, settings: RenderSettings) -> tuple[np.ndarray, np.ndarray, Image.Image]:
-    """Return gray sketch image, darkness map 0..1, and preview PIL image."""
+    """Return gray sketch image, darkness map 0..1, and preview PIL image.
+
+    The photo path deliberately avoids hard black adaptive-threshold output. A
+    professional pencil sketch is mostly white paper, gray contour lines, and
+    light tonal shading; harsh binary masks make foliage and stone texture turn
+    into ink blobs.
+    """
     gray = pil_to_cv_gray(image)
-    gray = cv2.equalizeHist(gray)
     strength = settings.sketch_strength / 100
 
     if settings.input_type == "photo":
-        inv = 255 - gray
-        blur_size = int(13 + strength * 34)
-        if blur_size % 2 == 0:
-            blur_size += 1
-        blur = cv2.GaussianBlur(inv, (blur_size, blur_size), 0)
-        dodge = cv2.divide(gray, 255 - blur, scale=256)
-        edges = cv2.Canny(gray, int(45 - 20 * strength), int(130 + 60 * strength))
-        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
-        adaptive = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            int(8 + strength * 8),
-        )
-        sketch = cv2.addWeighted(dodge, 0.78, adaptive, 0.22, 0)
-        sketch = np.minimum(sketch, 255 - (edges * (0.35 + strength * 0.45))).clip(0, 255).astype(np.uint8)
+        sketch = create_pencil_photo_sketch(gray, strength, settings)
     else:
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        adaptive = cv2.adaptiveThreshold(
-            blur,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            25,
-            int(7 + strength * 9),
-        )
-        sketch = cv2.addWeighted(gray, 0.32, adaptive, 0.68, 0)
+        sketch = create_existing_sketch_map(gray, strength)
 
-    contrast = 1.0 + strength * 0.85
-    sketch = np.clip((sketch.astype(np.float32) - 128) * contrast + 128, 0, 255).astype(np.uint8)
-    sketch = cv2.medianBlur(sketch, 3)
     darkness = (255 - sketch).astype(np.float32) / 255.0
-    darkness[darkness < 0.08] = 0
+    darkness[darkness < 0.035] = 0
 
     preview = Image.fromarray(sketch, mode="L").convert("RGB")
     return sketch, darkness, preview
+
+
+def create_pencil_photo_sketch(gray: np.ndarray, strength: float, settings: RenderSettings) -> np.ndarray:
+    """Convert a photo to a clean graphite-style sketch preview."""
+    denoised = cv2.bilateralFilter(gray, 7, 42, 42)
+
+    # Normalize broad lighting gradients before edge extraction. This keeps sky
+    # and shadow regions from becoming large black patches.
+    background = cv2.GaussianBlur(denoised, (0, 0), sigmaX=18 + strength * 18, sigmaY=18 + strength * 18)
+    normalized = cv2.divide(denoised, np.maximum(background, 1), scale=238)
+    normalized = np.clip(normalized, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=1.2 + strength * 0.9, tileGridSize=(8, 8))
+    normalized = clahe.apply(normalized)
+
+    # Pencil tone via color-dodge, then heavily whitened so it supports lines
+    # without looking like a grayscale poster.
+    inv = 255 - normalized
+    blur_size = int(19 + strength * 30)
+    if blur_size % 2 == 0:
+        blur_size += 1
+    dodge = cv2.divide(normalized, 255 - cv2.GaussianBlur(inv, (blur_size, blur_size), 0), scale=256)
+    tone_dark = (255 - dodge).astype(np.float32) / 255.0
+    tone_dark = cv2.GaussianBlur(tone_dark, (0, 0), sigmaX=1.1)
+
+    # Thin contour linework. Canny gives cleaner architecture than adaptive
+    # thresholding, and a small component filter removes sparkle-noise.
+    lower = int(max(18, 58 - strength * 26))
+    upper = int(min(210, 132 + strength * 42))
+    edges = cv2.Canny(normalized, lower, upper, L2gradient=True)
+    edges = remove_small_components(edges, min_area=4)
+    line_dark = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (3, 3), 0)
+
+    # Add a restrained adaptive-detail pass for roof tiles, carvings, and path
+    # cracks, but do not let it dominate foliage or sky.
+    block = int(35 + strength * 18)
+    if block % 2 == 0:
+        block += 1
+    adaptive = cv2.adaptiveThreshold(
+        normalized,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block,
+        int(7 + strength * 10),
+    )
+    detail = remove_small_components(255 - adaptive, min_area=6).astype(np.float32) / 255.0
+    detail = cv2.GaussianBlur(detail, (3, 3), 0)
+
+    # Highly textured zones are useful, but should read as pale graphite marks,
+    # not black blobs. Suppress dense local texture while preserving contours.
+    texture_density = cv2.GaussianBlur(np.maximum(line_dark, detail), (0, 0), sigmaX=5)
+    texture_suppression = np.clip(1.18 - texture_density * 1.55, 0.28, 1.0)
+
+    edge_gain = 0.34 + strength * 0.27
+    detail_gain = 0.12 + strength * 0.13
+    tone_gain = 0.16 + strength * 0.13
+    if getattr(settings, "style_type", "pencil") in {"ink", "marker"}:
+        edge_gain += 0.16
+        detail_gain += 0.08
+        tone_gain *= 0.55
+    elif getattr(settings, "style_type", "pencil") == "charcoal":
+        edge_gain += 0.05
+        tone_gain += 0.12
+
+    dark = line_dark * edge_gain + detail * detail_gain * texture_suppression + tone_dark * tone_gain
+    dark = np.clip(dark, 0, 0.72)
+    dark = graphite_quantize(dark)
+    paper = 252.0
+    sketch = paper - dark * 255.0
+    sketch = cv2.GaussianBlur(sketch.astype(np.uint8), (3, 3), 0)
+    return np.clip(sketch, 0, 255).astype(np.uint8)
+
+
+def create_existing_sketch_map(gray: np.ndarray, strength: float) -> np.ndarray:
+    """Preserve an uploaded sketch instead of converting it again.
+
+    A user-provided sketch is already the target artwork. Re-thresholding it
+    destroys soft graphite shading, eyelashes, hair strokes, and subtle facial
+    tones. This path mostly cleans paper color/lighting while retaining the
+    original mark darkness.
+    """
+    cleaned = cv2.bilateralFilter(gray, 5, 24, 24)
+    flat = normalize_sketch_paper(cleaned)
+    dark = (255 - flat).astype(np.float32) / 255.0
+
+    # Keep meaningful graphite tone, remove near-white scan noise, and preserve
+    # the darkest marks enough for eyes/hair/jewelry to remain recognizable.
+    floor = 0.018 if strength < 0.75 else 0.026
+    dark[dark < floor] = 0
+    soft_tone = np.power(np.clip(dark, 0, 1), 0.92)
+
+    # A very light edge lift helps the stroke extractor see contours, but it is
+    # blended beneath the original tone so the preview still resembles the upload.
+    edges = cv2.Canny(flat, 48, 150, L2gradient=True).astype(np.float32) / 255.0
+    edges = cv2.GaussianBlur(edges, (3, 3), 0)
+    edge_gain = 0.05 + strength * 0.10
+    final_dark = np.clip(soft_tone * (0.92 + strength * 0.12) + edges * edge_gain, 0, 0.86)
+
+    sketch = 255.0 - final_dark * 255.0
+    # Keep a paper-white background. This is intentionally not contrast boosted:
+    # high contrast is what made uploaded sketches collapse into poor line art.
+    return np.clip(sketch, 0, 255).astype(np.uint8)
+
+
+def normalize_sketch_paper(gray: np.ndarray) -> np.ndarray:
+    values = gray.reshape(-1)
+    low = float(np.percentile(values, 1.0))
+    high = float(np.percentile(values, 98.7))
+    if high - low < 24:
+        return gray
+    normalized = (gray.astype(np.float32) - low) * (255.0 / (high - low))
+    normalized = np.clip(normalized, 0, 255)
+
+    # Whiten only the very light paper range. Leave midtones alone so graphite
+    # gradients in skin, hair, and shadows survive.
+    paper_mask = normalized > 236
+    normalized[paper_mask] = 248 + (normalized[paper_mask] - 236) * (7 / 19)
+    return np.clip(normalized, 0, 255).astype(np.uint8)
+
+
+def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    if mask.max() == 0:
+        return mask
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    keep = np.zeros(mask.shape, dtype=np.uint8)
+    for idx in range(1, count):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            keep[labels == idx] = 255
+    return keep
+
+
+def graphite_quantize(dark: np.ndarray) -> np.ndarray:
+    """Compress ink-like blacks into a graphite value range."""
+    soft = np.power(np.clip(dark, 0, 1), 0.82)
+    return np.clip(soft, 0, 0.68)
 
 
 def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
@@ -201,11 +313,13 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
 
     apply_semantic_region_detection(strokes, semantic_regions)
     apply_art_director_to_strokes(strokes, art_director, settings)
+    apply_professional_stroke_polish(strokes, settings)
 
     # Limit total strokes while preserving layer variety.
     strokes = limit_strokes(strokes, settings.max_strokes)
     apply_artist_order(strokes, subject, settings, rng)
     apply_art_director_to_order(strokes, art_director)
+    apply_guided_artist_sequence(strokes, subject, settings, art_director)
     assign_timing(strokes, settings, rng)
     summary = summarize_passes(strokes)
 
@@ -492,7 +606,7 @@ def classify_centerline_layer(
     area_ratio = (bw * bh) / max(1, settings.width * settings.height)
     if darkness > 0.58 and length < 150:
         return "accent"
-    if subject == "portrait" and region in {"left_eye", "right_eye", "nose", "mouth"}:
+    if subject == "portrait" and region in {"left_eye", "right_eye", "left_eyebrow", "right_eyebrow", "nose", "mouth"}:
         return "key"
     if subject == "architecture" and region in {"entrance", "roof", "central_structure", "left_pillars", "right_pillars"}:
         return "key" if darkness > 0.18 or length > 42 else "secondary"
@@ -528,12 +642,17 @@ def extract_hatching_strokes(darkness: np.ndarray, subject: str, settings: Rende
             grad_angle = math.atan2(float(gy[y, x]), float(gx[y, x])) + math.pi / 2
             if abs(float(gx[y, x])) + abs(float(gy[y, x])) < 18:
                 # A deliberate hatching angle still feels more human than noise.
-                grad_angle = rng.choice([math.radians(35), math.radians(-35), math.radians(12), math.radians(-58)])
-            grad_angle += rng.uniform(-0.45, 0.45)
-            length = rng.uniform(step * 0.55, step * (1.2 + avg * 2.2))
+                grad_angle = professional_hatch_angle(subject, region_from_point(x, y, subject, settings.width, settings.height), x, y, settings)
+            else:
+                region = region_from_point(x, y, subject, settings.width, settings.height)
+                grad_angle = 0.65 * grad_angle + 0.35 * professional_hatch_angle(subject, region, x, y, settings)
+            grad_angle += rng.uniform(-0.16, 0.16)
+            length = rng.uniform(step * 0.9, step * (1.9 + avg * 2.6))
             dx = math.cos(grad_angle) * length / 2
             dy = math.sin(grad_angle) * length / 2
-            points = [(x - dx, y - dy), (x + dx, y + dy)]
+            curve = rng.uniform(-0.10, 0.10) * length
+            nx, ny = -math.sin(grad_angle), math.cos(grad_angle)
+            points = [(x - dx, y - dy), (x + nx * curve, y + ny * curve), (x + dx, y + dy)]
             layer = "shading" if avg > 0.16 else "texture"
             region = region_from_point(x, y, subject, settings.width, settings.height)
             strokes.append(build_stroke(
@@ -544,7 +663,7 @@ def extract_hatching_strokes(darkness: np.ndarray, subject: str, settings: Rende
 
             # Cross hatch for deeper areas.
             if avg > 0.26 and rng.random() < 0.35 * density:
-                angle2 = grad_angle + math.radians(70 + rng.uniform(-12, 12))
+                angle2 = grad_angle + math.radians(62 + rng.uniform(-6, 6))
                 length2 = length * rng.uniform(0.55, 0.9)
                 dx2 = math.cos(angle2) * length2 / 2
                 dy2 = math.sin(angle2) * length2 / 2
@@ -555,6 +674,24 @@ def extract_hatching_strokes(darkness: np.ndarray, subject: str, settings: Rende
                     opacity_override=0.2 + avg * 0.43,
                 ))
     return strokes
+
+
+def professional_hatch_angle(subject: str, region: str, x: float, y: float, settings: RenderSettings) -> float:
+    if subject == "portrait":
+        if region in {"hair_top", "hair_side"}:
+            cx = settings.width * 0.5
+            return math.atan2(y - settings.height * 0.18, x - cx) + math.pi / 2
+        if region in {"face_outline", "nose", "mouth"}:
+            return math.radians(-18)
+        return math.radians(16)
+    if subject == "architecture":
+        if region == "roof":
+            return 0.0
+        if region in {"left_pillars", "right_pillars", "central_structure"}:
+            return math.radians(90)
+        if region == "ground":
+            return math.radians(-12)
+    return math.radians(-24)
 
 
 
@@ -692,7 +829,7 @@ def classify_contour_layer(
         return "accent"
     if area_ratio > 0.08 or length > min(settings.width, settings.height) * 0.27:
         return "contour"
-    if subject == "portrait" and region in {"left_eye", "right_eye", "nose", "mouth"}:
+    if subject == "portrait" and region in {"left_eye", "right_eye", "left_eyebrow", "right_eyebrow", "nose", "mouth"}:
         return "key"
     if subject == "architecture" and region in {"entrance", "roof", "central_structure"}:
         return "key"
@@ -708,6 +845,10 @@ def region_from_point(x: float, y: float, subject: str, width: int, height: int)
     if subject == "portrait":
         if yn < 0.25:
             return "hair_top"
+        if 0.25 <= yn < 0.34 and 0.24 <= xn < 0.49:
+            return "left_eyebrow"
+        if 0.25 <= yn < 0.34 and 0.51 <= xn <= 0.76:
+            return "right_eyebrow"
         if 0.30 <= yn <= 0.48 and 0.25 <= xn < 0.48:
             return "left_eye"
         if 0.30 <= yn <= 0.48 and 0.52 <= xn <= 0.75:
@@ -762,18 +903,22 @@ def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
     if subject == "portrait":
         priority = {
             "overall_subject": -14,
-            "face_outline": -8,
-            "left_eye": -18,
-            "right_eye": -18,
-            "nose": -10,
-            "mouth": -7,
-            "hair_top": 10,
-            "hair_side": 12,
-            "jaw_cheek": 8,
+            "left_eye": -48,
+            "right_eye": -47,
+            "left_eyebrow": -40,
+            "right_eyebrow": -39,
+            "mouth": -34,
+            "nose": -30,
+            "face_outline": -14,
+            "jaw_cheek": -12,
+            "hair_top": 8,
+            "hair_side": 10,
             "neck_clothing": 15,
         }.get(region, 0)
-        if layer == "accent" and region in {"left_eye", "right_eye"}:
+        if layer == "accent" and region in {"left_eye", "right_eye", "left_eyebrow", "right_eyebrow", "mouth"}:
             priority += 22  # pupils/dark marks near the end
+        if layer in {"shading", "texture"}:
+            priority += 44
         return priority
     if subject == "architecture":
         priority = {
@@ -801,7 +946,7 @@ def subject_priority_adjustment(region: str, layer: str, subject: str) -> float:
 
 
 def apply_artist_order(strokes: list[Stroke], subject: str, settings: RenderSettings, rng: random.Random) -> None:
-    randomness = settings.human_randomness / 100
+    randomness = min(settings.human_randomness / 100, 0.22 if settings.input_type == "sketch" else 0.45)
     for stroke in strokes:
         x1, y1, x2, y2 = stroke.bbox
         cx = (x1 + x2) / 2 / settings.width
@@ -810,14 +955,14 @@ def apply_artist_order(strokes: list[Stroke], subject: str, settings: RenderSett
         size_bias = -min(10, stroke.length / 75) if stroke.layer == "contour" else min(8, stroke.length / 180)
         dark_bias = stroke.darkness * (14 if stroke.layer not in {"accent", "layout"} else 4)
         region_bias = subject_priority_adjustment(stroke.region, stroke.layer, subject)
-        jitter = rng.uniform(-16, 16) * randomness
+        jitter = rng.uniform(-8, 8) * randomness
         revisit_bias = 0
         # A small subset of previous-looking lines get delayed as rework/strengthening.
-        if stroke.layer in {"contour", "secondary"} and stroke.darkness > 0.32 and rng.random() < 0.12 * randomness:
+        if stroke.layer in {"contour", "secondary"} and stroke.darkness > 0.32 and rng.random() < 0.06 * randomness:
             revisit_bias += rng.uniform(18, 38)
             stroke.layer = "accent" if settings.accent_pass else "secondary"
         stroke.order_score = LAYER_WEIGHT.get(stroke.layer, 50) + center_bias + size_bias + dark_bias + region_bias + revisit_bias + jitter
-    strokes.sort(key=lambda s: (s.order_score, s.region, s.length))
+    strokes.sort(key=lambda s: (s.order_score, region_order_key(s.region, subject), s.bbox[1], s.bbox[0]))
 
     # Within the same pass, make short bursts around nearby regions so movement feels hand-driven.
     for layer in LAYER_WEIGHT:
@@ -825,9 +970,139 @@ def apply_artist_order(strokes: list[Stroke], subject: str, settings: RenderSett
         if len(indices) < 12:
             continue
         subset = [strokes[i] for i in indices]
-        subset.sort(key=lambda s: (s.region, s.bbox[1] + rng.uniform(-settings.height * 0.05, settings.height * 0.05), s.bbox[0]))
+        subset.sort(key=lambda s: (region_order_key(s.region, subject), s.bbox[1], s.bbox[0]))
+        subset = order_strokes_continuously(subset, max_jump=min(settings.width, settings.height) * 0.22)
         for pos, original_index in enumerate(indices):
             strokes[original_index] = subset[pos]
+
+
+def apply_professional_stroke_polish(strokes: list[Stroke], settings: RenderSettings) -> None:
+    for stroke in strokes:
+        if len(stroke.points) > 2 and stroke.effect == "draw":
+            stroke.points = smooth_polyline(stroke.points, passes=1 if stroke.layer in {"contour", "key", "secondary"} else 0)
+        stroke.points = clip_points(stroke.points, settings.width, settings.height)
+        stroke.length = polyline_length(stroke.points)
+        stroke.bbox = bbox_from_points(stroke.points)
+        if settings.input_type == "sketch":
+            stroke.jitter *= 0.35
+            if stroke.layer in {"contour", "key", "secondary"}:
+                stroke.opacity = min(0.82, stroke.opacity * 0.92)
+                stroke.thickness = max(0.45, stroke.thickness * 0.82)
+
+
+def smooth_polyline(points: list[tuple[float, float]], passes: int = 1) -> list[tuple[float, float]]:
+    if len(points) < 4 or passes <= 0:
+        return points
+    smoothed = points
+    for _ in range(passes):
+        out = [smoothed[0]]
+        for a, b in zip(smoothed, smoothed[1:]):
+            q = (a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25)
+            r = (a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75)
+            out.extend([q, r])
+        out.append(smoothed[-1])
+        smoothed = out
+    return smoothed
+
+
+def order_strokes_continuously(strokes: list[Stroke], max_jump: float) -> list[Stroke]:
+    if len(strokes) < 3:
+        return strokes
+    by_region: dict[str, list[Stroke]] = defaultdict(list)
+    for stroke in strokes:
+        by_region[stroke.region].append(stroke)
+    ordered: list[Stroke] = []
+    for region in sorted(by_region):
+        remaining = by_region[region][:]
+        remaining.sort(key=lambda s: (s.bbox[1], s.bbox[0]))
+        current = remaining.pop(0)
+        ordered.append(current)
+        while remaining:
+            end = current.points[-1]
+            best_idx = min(
+                range(len(remaining)),
+                key=lambda i: min(math.dist(end, remaining[i].points[0]), math.dist(end, remaining[i].points[-1])),
+            )
+            candidate = remaining.pop(best_idx)
+            start_dist = math.dist(end, candidate.points[0])
+            end_dist = math.dist(end, candidate.points[-1])
+            if end_dist < start_dist and candidate.layer not in {"shading", "texture"}:
+                candidate.points = list(reversed(candidate.points))
+            if min(start_dist, end_dist) > max_jump and ordered:
+                # Start a new local cluster from top-left rather than jumping wildly across the canvas.
+                remaining.append(candidate)
+                remaining.sort(key=lambda s: (s.bbox[1], s.bbox[0]))
+                candidate = remaining.pop(0)
+            ordered.append(candidate)
+            current = candidate
+    return ordered
+
+
+def region_order_key(region: str, subject: str) -> tuple[int, str]:
+    if subject == "portrait":
+        order = {
+            "face_outline": 0,
+            "left_eye": 1,
+            "right_eye": 2,
+            "left_eyebrow": 3,
+            "right_eyebrow": 4,
+            "mouth": 5,
+            "nose": 6,
+            "hair_top": 7,
+            "hair_side": 8,
+            "neck_clothing": 9,
+        }
+        return order.get(region, 20), region
+    if subject == "architecture":
+        order = {"roof": 0, "central_structure": 1, "left_pillars": 2, "right_pillars": 3, "entrance": 4, "ground": 5, "side_structure": 6}
+        return order.get(region, 20), region
+    return 0, region
+
+
+def apply_guided_artist_sequence(strokes: list[Stroke], subject: str, settings: RenderSettings, art_director: dict[str, object]) -> None:
+    if subject != "portrait":
+        return
+    sequence_enabled = bool(art_director.get("artist_sequence")) or settings.planning_mode == "art_director_json"
+    if not sequence_enabled:
+        return
+    region_step = {
+        "left_eye": 0,
+        "right_eye": 0,
+        "left_eyebrow": 1,
+        "right_eyebrow": 1,
+        "mouth": 2,
+        "nose": 3,
+        "face_outline": 4,
+        "jaw_cheek": 4,
+        "hair_top": 5,
+        "hair_side": 5,
+        "neck_clothing": 6,
+    }
+    layer_offset = {
+        "layout": -0.20,
+        "key": 0.00,
+        "contour": 0.15,
+        "secondary": 0.35,
+        "texture": 7.10,
+        "shading": 7.25,
+        "accent": 7.55,
+    }
+    for stroke in strokes:
+        base = region_step.get(stroke.region, 6)
+        if stroke.layer in {"texture", "shading", "accent"}:
+            base = max(base, 7)
+        stroke.order_score = base * 100 + layer_offset.get(stroke.layer, 0.5) * 100 + stroke.bbox[1] * 0.01 + stroke.bbox[0] * 0.002
+    strokes.sort(key=lambda s: (s.order_score, s.region, s.bbox[1], s.bbox[0]))
+    for step in sorted(set(region_step.values()) | {7}):
+        indices = [
+            idx for idx, stroke in enumerate(strokes)
+            if (max(region_step.get(stroke.region, 6), 7) if stroke.layer in {"texture", "shading", "accent"} else region_step.get(stroke.region, 6)) == step
+        ]
+        if len(indices) < 3:
+            continue
+        ordered = order_strokes_continuously([strokes[idx] for idx in indices], max_jump=min(settings.width, settings.height) * 0.18)
+        for idx, stroke in zip(indices, ordered):
+            strokes[idx] = stroke
 
 
 def assign_timing(strokes: list[Stroke], settings: RenderSettings, rng: random.Random) -> None:
