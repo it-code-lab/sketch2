@@ -12,6 +12,7 @@ const videoOutput = $('videoOutput');
 const quickPreviewBtn = $('quickPreviewBtn');
 const cleanupOutputsBtn = $('cleanupOutputsBtn');
 const cleanupStatus = $('cleanupStatus');
+const togglePreviewPanelBtn = $('togglePreviewPanelBtn');
 const sectionPlanner = $('sectionPlanner');
 const applySectionGuideBtn = $('applySectionGuideBtn');
 const motionPreviewCanvas = $('motionPreviewCanvas');
@@ -73,6 +74,9 @@ let lastPreviewPlan = null;
 let lastSketchPreviewSrc = '';
 let quickPreviewAnimation = null;
 let sectionDragState = null;
+let selectedSectionRegion = null;
+let sectionFocusSelectedOnly = false;
+let previewPanelCollapsed = localStorage.getItem('previewPanelCollapsed') === 'true';
 const filePreviewUrls = new Map();
 
 const fields = [
@@ -118,6 +122,11 @@ playTimelinePreviewBtn.addEventListener('click', () => toggleStoryboardPreview()
 renderTimelineBtn.addEventListener('click', () => renderTimelineQueued());
 quickPreviewBtn.addEventListener('click', () => toggleQuickMotionPreview());
 cleanupOutputsBtn.addEventListener('click', () => cleanupGeneratedOutputs());
+togglePreviewPanelBtn?.addEventListener('click', () => {
+  previewPanelCollapsed = !previewPanelCollapsed;
+  localStorage.setItem('previewPanelCollapsed', String(previewPanelCollapsed));
+  updatePreviewPanelCollapse();
+});
 cameraMovePreset.addEventListener('change', () => applyCameraPreset());
 artDirectorBtn.addEventListener('click', () => analyzeCurrentImageWithArtDirector());
 timelineArtDirectorBtn.addEventListener('click', () => analyzeTimelineWithArtDirector());
@@ -138,14 +147,47 @@ sectionPlanner.addEventListener('click', (event) => {
     separateSectionBoxes();
     return;
   }
+  if (action === 'add-part') {
+    addSectionPart();
+    return;
+  }
+  if (action === 'focus-selected') {
+    sectionFocusSelectedOnly = !sectionFocusSelectedOnly;
+    updateSectionFocusMode();
+    return;
+  }
+  if (action === 'delete-part') {
+    deleteSelectedSectionPart();
+    return;
+  }
+  const editButton = event.target.closest?.('.section-edit-button');
+  if (editButton) {
+    selectSectionRegion(editButton.closest('.section-box')?.dataset?.region, false);
+    return;
+  }
   const target = event.target.closest?.('[data-region]');
-  if (target) selectSectionRegion(target.dataset.region);
+  if (target) selectSectionRegion(target.dataset.region, false);
 });
 sectionPlanner.addEventListener('input', (event) => {
-  if (event.target?.dataset?.sectionField) updateSectionOverlayFromRows();
+  if (event.target?.dataset?.inspectorField) {
+    updateSectionRowFromInspector(event.target);
+    return;
+  }
+  if (event.target?.dataset?.sectionField) {
+    updateSectionOverlayFromRows();
+    syncSectionGuideToJson(false);
+  }
 });
 sectionPlanner.addEventListener('change', (event) => {
-  if (event.target?.dataset?.sectionField) updateSectionOverlayFromRows();
+  if (event.target?.dataset?.inspectorField) {
+    updateSectionRowFromInspector(event.target);
+    return;
+  }
+  if (event.target?.dataset?.sectionField) {
+    updateSectionOverlayFromRows();
+    renderSectionInspector(selectedSectionRegion);
+    syncSectionGuideToJson(false);
+  }
 });
 sectionPlanner.addEventListener('pointerdown', (event) => startSectionDrag(event));
 window.addEventListener('pointermove', (event) => updateSectionDrag(event));
@@ -428,23 +470,40 @@ function renderSectionPlanner(regions, subjectType = 'auto') {
   sectionPlanner.innerHTML = `
     <div class="section-planner-head">
       <strong>Editable drawing guide</strong>
-      <span>Click a colored area to edit it. Area fields are X, Y, W, H percentages of the image.</span>
+      <span>Select a part, move its boundary, then edit order, shape, stroke direction, and shading beside the map.</span>
       <div class="section-map-actions">
         <button type="button" data-section-action="portrait-parts">Use portrait parts</button>
         <button type="button" data-section-action="separate-boxes">Separate boxes</button>
+        <button type="button" data-section-action="add-part">Add part</button>
+        <button type="button" data-section-action="focus-selected" aria-pressed="${sectionFocusSelectedOnly ? 'true' : 'false'}">${sectionFocusSelectedOnly ? 'Show all parts' : 'Focus selected part'}</button>
       </div>
     </div>
-    <div class="section-map">
-      ${imageSrc ? `<img src="${imageSrc}" alt="Section map" />` : ''}
-      <svg viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="xMidYMid meet" aria-label="Editable section overlay">
-        ${ordered.map((region, idx) => sectionOverlayHtml(region, idx + 1)).join('')}
-      </svg>
+    <div class="section-workspace">
+      <div class="section-map">
+        ${imageSrc ? `<img src="${imageSrc}" alt="Section map" />` : ''}
+        <svg viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="xMidYMid meet" aria-label="Editable section overlay">
+          ${ordered.map((region, idx) => sectionOverlayHtml(region, idx + 1)).join('')}
+        </svg>
+      </div>
+      <div class="section-inspector empty">Select a drawing part to edit its properties.</div>
     </div>
-    <div class="section-grid">
-      ${ordered.map((region, idx) => sectionRowHtml(region, idx + 1, subjectType, canvasWidth, canvasHeight)).join('')}
-    </div>
+    <details class="section-grid-wrap">
+      <summary>Advanced table</summary>
+      <div class="section-grid">
+        ${sectionTableHeaderHtml()}
+        ${ordered.map((region, idx) => sectionRowHtml(region, idx + 1, subjectType, canvasWidth, canvasHeight)).join('')}
+      </div>
+    </details>
   `;
-  selectSectionRegion(ordered[0]?.name);
+  selectSectionRegion(ordered[0]?.name, false);
+  updateSectionFocusMode();
+}
+
+function updatePreviewPanelCollapse() {
+  document.body.classList.toggle('preview-collapsed', previewPanelCollapsed);
+  if (!togglePreviewPanelBtn) return;
+  togglePreviewPanelBtn.textContent = previewPanelCollapsed ? 'Show preview' : 'Collapse preview';
+  togglePreviewPanelBtn.setAttribute('aria-expanded', previewPanelCollapsed ? 'false' : 'true');
 }
 
 function sectionOverlayHtml(region, order) {
@@ -458,11 +517,29 @@ function sectionOverlayHtml(region, order) {
       <rect class="section-box-body" x="${x1}" y="${y1}" width="${w}" height="${h}"></rect>
       <polygon class="section-polygon-body hidden"></polygon>
       <text x="${x1 + 8}" y="${y1 + 22}" data-label="${label}">${order}. ${label}</text>
+      <g class="section-edit-button" transform="translate(${Math.max(0, x1 + w - 62)}, ${Math.max(0, y1 - 32)})">
+        <rect width="58" height="24" rx="5"></rect>
+        <text x="29" y="17">Edit</text>
+      </g>
       <rect class="resize-handle nw" data-handle="nw" x="${x1 - 7}" y="${y1 - 7}" width="14" height="14"></rect>
       <rect class="resize-handle ne" data-handle="ne" x="${x1 + w - 7}" y="${y1 - 7}" width="14" height="14"></rect>
       <rect class="resize-handle sw" data-handle="sw" x="${x1 - 7}" y="${y1 + h - 7}" width="14" height="14"></rect>
       <rect class="resize-handle se" data-handle="se" x="${x1 + w - 7}" y="${y1 + h - 7}" width="14" height="14"></rect>
     </g>
+  `;
+}
+
+function sectionTableHeaderHtml() {
+  return `
+    <div class="section-row section-row-header" aria-hidden="true">
+      <span>Order</span>
+      <span>Part</span>
+      <span>Completion</span>
+      <span>Shape</span>
+      <span class="section-area-header">Area: X / Y / W / H / Rot</span>
+      <span>Stroke direction</span>
+      <span>Shading direction</span>
+    </div>
   `;
 }
 
@@ -520,13 +597,76 @@ function roundOne(value) {
   return Math.round(value * 10) / 10;
 }
 
-function selectSectionRegion(region, scrollRow = true) {
+function selectSectionRegion(region, scrollRow = false) {
   if (!region || !sectionPlanner) return;
+  selectedSectionRegion = region;
   sectionPlanner.querySelectorAll('[data-region]').forEach(el => {
     el.classList.toggle('selected', el.dataset.region === region);
   });
   const row = sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(region)}"]`);
   if (scrollRow) row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  renderSectionInspector(region);
+  updateSectionFocusMode();
+}
+
+function updateSectionFocusMode() {
+  if (!sectionPlanner) return;
+  sectionPlanner.classList.toggle('focus-selected', sectionFocusSelectedOnly);
+  const button = sectionPlanner.querySelector('[data-section-action="focus-selected"]');
+  if (button) {
+    button.textContent = sectionFocusSelectedOnly ? 'Show all parts' : 'Focus selected part';
+    button.setAttribute('aria-pressed', sectionFocusSelectedOnly ? 'true' : 'false');
+    button.classList.toggle('active-toggle', sectionFocusSelectedOnly);
+  }
+}
+
+function renderSectionInspector(region) {
+  const inspector = sectionPlanner?.querySelector('.section-inspector');
+  if (!inspector) return;
+  const row = region ? sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(region)}"]`) : null;
+  if (!row) {
+    inspector.className = 'section-inspector empty';
+    inspector.textContent = 'Select a drawing part to edit its properties.';
+    return;
+  }
+  inspector.className = 'section-inspector';
+  inspector.dataset.inspectorRegion = region;
+  const label = region.replaceAll('_', ' ');
+  const value = name => row.querySelector(`[data-section-field="${name}"]`)?.value || '';
+  const area = readSectionArea(row);
+  inspector.innerHTML = `
+    <div class="section-inspector-title">
+      <div>
+        <span>Selected part</span>
+        <strong>${escapeHtml(label)}</strong>
+      </div>
+      <button type="button" data-section-action="delete-part">Delete</button>
+    </div>
+    <div class="section-inspector-grid">
+      <label>Order <input type="number" min="1" max="99" value="${escapeHtml(value('order'))}" data-inspector-field="order" /></label>
+      <label>Mode <select data-inspector-field="mode">${modeOptions(value('mode'))}</select></label>
+      <label>Shape <select data-inspector-field="shape">${shapeOptions(value('shape'))}</select></label>
+      <label>X % <input type="number" min="0" max="100" step="0.5" value="${area.x}" data-inspector-field="x" /></label>
+      <label>Y % <input type="number" min="0" max="100" step="0.5" value="${area.y}" data-inspector-field="y" /></label>
+      <label>W % <input type="number" min="1" max="100" step="0.5" value="${area.w}" data-inspector-field="w" /></label>
+      <label>H % <input type="number" min="1" max="100" step="0.5" value="${area.h}" data-inspector-field="h" /></label>
+      <label>Rotate <input type="number" min="-180" max="180" step="1" value="${escapeHtml(value('rotation'))}" data-inspector-field="rotation" /></label>
+      <label>Stroke <select data-inspector-field="direction">${directionOptions(value('direction'))}</select></label>
+      <label>Shading <select data-inspector-field="shading_direction">${directionOptions(value('shading_direction'))}</select></label>
+    </div>
+  `;
+}
+
+function updateSectionRowFromInspector(control) {
+  const inspector = control.closest('.section-inspector');
+  const region = inspector?.dataset?.inspectorRegion;
+  const field = control.dataset.inspectorField;
+  const row = region ? sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(region)}"]`) : null;
+  const rowControl = row?.querySelector(`[data-section-field="${field}"]`);
+  if (!rowControl) return;
+  rowControl.value = control.value;
+  updateSectionOverlayFromRows();
+  syncSectionGuideToJson(false);
 }
 
 function updateSectionOverlayFromRows() {
@@ -567,6 +707,12 @@ function updateSectionOverlayFromRows() {
     text?.setAttribute('x', x + 8);
     text?.setAttribute('y', y + 22);
     if (text) text.textContent = `${order}. ${text.dataset.label || region.replaceAll('_', ' ')}`;
+    const editButton = group.querySelector('.section-edit-button');
+    if (editButton) {
+      const bx = Math.max(0, Math.min(canvasWidth - 62, x + Math.max(1, w) - 62));
+      const by = Math.max(0, y - 32);
+      editButton.setAttribute('transform', `translate(${roundOne(bx)}, ${roundOne(by)})`);
+    }
     positionSectionHandles(group, x, y, Math.max(1, w), Math.max(1, h));
   }
 }
@@ -639,6 +785,7 @@ function rotatePointPct(x, y, cx, cy, degrees) {
 }
 
 function startSectionDrag(event) {
+  if (event.target.closest?.('.section-edit-button')) return;
   const group = event.target.closest?.('.section-box');
   if (!group || !sectionPlanner.contains(group)) return;
   const svg = group.ownerSVGElement;
@@ -690,6 +837,10 @@ function updateSectionDrag(event) {
 }
 
 function endSectionDrag() {
+  if (sectionDragState) {
+    syncSectionGuideToJson(false);
+    renderSectionInspector(sectionDragState.region);
+  }
   sectionDragState = null;
   document.body.classList.remove('section-dragging');
 }
@@ -759,6 +910,86 @@ function separateSectionBoxes() {
   updateSectionOverlayFromRows();
   syncSectionGuideToJson(false);
   log('Separated section boxes into a clean editable layout. Adjust each part over the image as needed.');
+}
+
+function addSectionPart() {
+  const rows = Array.from(sectionPlanner?.querySelectorAll('.section-row') || []);
+  if (!rows.length) return;
+  const settings = lastPreviewPlan?.settings || {};
+  const canvasWidth = Number(settings.width || 720);
+  const canvasHeight = Number(settings.height || 1280);
+  const nextOrder = Math.max(0, ...rows.map(row => Number(row.querySelector('[data-section-field="order"]')?.value || 0))) + 1;
+  const proposed = `part_${nextOrder}`;
+  const typed = window.prompt('Name this drawing part', proposed);
+  const regionName = uniqueSectionRegionName(normalizeSectionRegionName(typed || proposed));
+  if (!regionName) return;
+  const region = {
+    name: regionName,
+    role: 'custom',
+    confidence: 1,
+    bbox: [0.35 * canvasWidth, 0.35 * canvasHeight, 0.65 * canvasWidth, 0.55 * canvasHeight]
+  };
+  sectionPlanner.querySelector('.section-map svg')?.insertAdjacentHTML('beforeend', sectionOverlayHtml(region, nextOrder));
+  sectionPlanner.querySelector('.section-grid')?.insertAdjacentHTML('beforeend', sectionRowHtml(region, nextOrder, $('subject_type').value || 'auto', canvasWidth, canvasHeight));
+  updateSectionOverlayFromRows();
+  selectSectionRegion(regionName, false);
+  syncSectionGuideToJson(false);
+  log(`Added drawing part "${regionName.replaceAll('_', ' ')}". Move its boundary over the image and edit its properties beside the map.`);
+}
+
+function deleteSelectedSectionPart() {
+  const region = selectedSectionRegion;
+  if (!region) return;
+  const rows = Array.from(sectionPlanner?.querySelectorAll('.section-row') || []);
+  if (rows.length <= 1) {
+    log('Keep at least one drawing part in the guide.');
+    return;
+  }
+  sectionPlanner.querySelector(`.section-box[data-region="${CSS.escape(region)}"]`)?.remove();
+  sectionPlanner.querySelector(`.section-row[data-region="${CSS.escape(region)}"]`)?.remove();
+  const next = sectionPlanner.querySelector('.section-row')?.dataset?.region || null;
+  selectedSectionRegion = null;
+  updateSectionOverlayFromRows();
+  selectSectionRegion(next, false);
+  syncSectionGuideToJson(false);
+}
+
+function normalizeSectionRegionName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48) || 'part';
+}
+
+function uniqueSectionRegionName(base) {
+  const existing = new Set(Array.from(sectionPlanner?.querySelectorAll('.section-row') || []).map(row => row.dataset.region));
+  let name = base;
+  let idx = 2;
+  while (existing.has(name)) {
+    name = `${base}_${idx}`;
+    idx += 1;
+  }
+  return name;
+}
+
+function modeOptions(selected = 'complete') {
+  const rows = [
+    ['complete', 'Complete before next'],
+    ['lines_first', 'Lines first, shade later'],
+    ['shading_only', 'Shading pass only'],
+    ['skip', 'Skip']
+  ];
+  return rows.map(([value, label]) => `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`).join('');
+}
+
+function shapeOptions(selected = 'rectangle') {
+  const rows = [
+    ['rectangle', 'Rectangle'],
+    ['freeform', 'Freeform mask']
+  ];
+  return rows.map(([value, label]) => `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`).join('');
 }
 
 function directionOptions(selected) {
@@ -1494,6 +1725,7 @@ refreshHealth();
 loadHandPresets();
 loadHandAssets();
 loadProfiles();
+updatePreviewPanelCollapse();
 applyCameraPreset();
 
 analyzeBtn.addEventListener('click', async () => {
@@ -1634,11 +1866,136 @@ async function toggleQuickMotionPreview() {
     return;
   }
   try {
+    syncSectionGuideToJson(false);
     const targetImage = await loadImage(lastSketchPreviewSrc);
-    playQuickMotionPreview(lastPreviewPlan, targetImage);
+    playQuickMotionPreview(buildSectionGuidedPreviewPlan(lastPreviewPlan), targetImage);
   } catch (err) {
     log(err.message || String(err));
   }
+}
+
+function buildSectionGuidedPreviewPlan(plan) {
+  if (!plan?.strokes?.length) return plan;
+  let director = {};
+  try {
+    const raw = $('art_director_json')?.value?.trim() || '';
+    director = raw ? JSON.parse(raw) : {};
+  } catch {
+    return plan;
+  }
+  const sequence = Array.isArray(director.section_sequence)
+    ? director.section_sequence
+        .filter(row => row?.region)
+        .map((row, idx) => ({ ...row, order: Number(row.order || idx + 1), idx }))
+        .sort((a, b) => a.order - b.order || a.idx - b.idx)
+    : [];
+  if (!sequence.length) return plan;
+
+  const settings = plan.settings || {};
+  const width = Number(settings.width || 720);
+  const height = Number(settings.height || 1280);
+  const rules = sequence.map(section => ({
+    ...section,
+    polygon: sectionPreviewPolygon(section)
+  })).filter(section => section.polygon.length >= 3);
+  const ruleByRegion = new Map(sequence.map((section, idx) => [section.region, { ...section, sortIndex: idx }]));
+  const fallbackOrder = sequence.length + 20;
+  const strokes = plan.strokes.map(stroke => ({
+    ...stroke,
+    points: Array.isArray(stroke.points) ? stroke.points.map(point => [...point]) : []
+  }));
+
+  for (const stroke of strokes) {
+    const owner = rules.find(rule => strokeTouchesPreviewPolygon(stroke, rule.polygon, width, height));
+    if (owner) stroke.region = owner.region;
+  }
+
+  const visible = strokes.filter(stroke => ruleByRegion.get(stroke.region)?.mode !== 'skip' && Number(stroke.opacity ?? 1) > 0);
+  visible.sort((a, b) => {
+    const ar = ruleByRegion.get(a.region);
+    const br = ruleByRegion.get(b.region);
+    const ao = ar ? ar.order : fallbackOrder;
+    const bo = br ? br.order : fallbackOrder;
+    const ap = sectionPreviewLayerPhase(a.layer, ar?.mode);
+    const bp = sectionPreviewLayerPhase(b.layer, br?.mode);
+    return ao - bo || ap - bp || Number(a.bbox?.[1] || 0) - Number(b.bbox?.[1] || 0) || Number(a.bbox?.[0] || 0) - Number(b.bbox?.[0] || 0);
+  });
+
+  const durationMs = Math.max(
+    Number(settings.duration_seconds || 0) * 1000,
+    ...visible.map(stroke => Number(stroke.end_ms || 0)),
+    1000
+  );
+  const weights = visible.map(stroke => Math.max(20, Number(stroke.duration_ms || 0) || Math.max(20, Number(stroke.length || 24) * 2.2)));
+  const totalWeight = weights.reduce((sum, value) => sum + value, 0) || 1;
+  let cursor = 0;
+  visible.forEach((stroke, idx) => {
+    const dur = Math.max(16, weights[idx] / totalWeight * durationMs);
+    stroke.start_ms = Math.round(cursor);
+    cursor += dur;
+    stroke.duration_ms = Math.round(dur);
+    stroke.end_ms = Math.round(cursor);
+  });
+
+  return { ...plan, strokes: visible };
+}
+
+function strokeCenterPct(stroke, width, height) {
+  if (Array.isArray(stroke.bbox) && stroke.bbox.length >= 4) {
+    return [
+      ((Number(stroke.bbox[0]) + Number(stroke.bbox[2])) / 2) / width * 100,
+      ((Number(stroke.bbox[1]) + Number(stroke.bbox[3])) / 2) / height * 100
+    ];
+  }
+  const points = Array.isArray(stroke.points) ? stroke.points : [];
+  if (!points.length) return [50, 50];
+  const sum = points.reduce((acc, point) => [acc[0] + Number(point[0] || 0), acc[1] + Number(point[1] || 0)], [0, 0]);
+  return [sum[0] / points.length / width * 100, sum[1] / points.length / height * 100];
+}
+
+function sectionPreviewPolygon(section) {
+  if (Array.isArray(section.polygon_pct) && section.polygon_pct.length >= 3) {
+    return section.polygon_pct.map(point => [Number(point[0]), Number(point[1])]);
+  }
+  if (Array.isArray(section.bbox_pct) && section.bbox_pct.length >= 4) {
+    const [x, y, w, h] = section.bbox_pct.map(Number);
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+  }
+  return [];
+}
+
+function pointInPreviewPolygon(point, polygon) {
+  const [x, y] = point;
+  let inside = false;
+  let j = polygon.length - 1;
+  for (let i = 0; i < polygon.length; i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    if (((yi > y) !== (yj > y)) && x < (xj - xi) * (y - yi) / Math.max(1e-6, yj - yi) + xi) inside = !inside;
+    j = i;
+  }
+  return inside;
+}
+
+function strokeTouchesPreviewPolygon(stroke, polygon, width, height) {
+  const samples = [strokeCenterPct(stroke, width, height)];
+  const points = Array.isArray(stroke.points) ? stroke.points : [];
+  if (points.length) {
+    const step = Math.max(1, Math.floor(points.length / 8));
+    for (let i = 0; i < points.length; i += step) {
+      samples.push([Number(points[i][0] || 0) / width * 100, Number(points[i][1] || 0) / height * 100]);
+    }
+    const last = points[points.length - 1];
+    samples.push([Number(last[0] || 0) / width * 100, Number(last[1] || 0) / height * 100]);
+  }
+  return samples.some(point => pointInPreviewPolygon(point, polygon));
+}
+
+function sectionPreviewLayerPhase(layer, mode = 'complete') {
+  const phases = { layout: -0.2, key: 0, contour: 0.1, secondary: 0.24, texture: 0.42, shading: 0.58, accent: 0.78 };
+  if (mode === 'lines_first' && ['texture', 'shading', 'smudge'].includes(layer)) return 1.4;
+  if (mode === 'shading_only' && !['texture', 'shading', 'smudge'].includes(layer)) return 1.2;
+  return phases[layer] ?? 0.5;
 }
 
 function playQuickMotionPreview(plan, targetImage) {

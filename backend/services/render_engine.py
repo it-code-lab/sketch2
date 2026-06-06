@@ -273,6 +273,7 @@ def render_frames(
     completed = background.copy().convert("RGBA")
     target_reveal = prepare_target_reveal(target_sketch, background.size, settings)
     reveal_mask = Image.new("L", background.size, 0) if target_reveal is not None else None
+    guided_sections = '"section_sequence"' in getattr(settings, "art_director_json", "")
     render_strokes = professional_render_strokes(strokes, settings) if target_reveal is not None else strokes
     last_completed_index = -1
     hand_tip_smoothed: tuple[float, float] | None = None
@@ -317,7 +318,7 @@ def render_frames(
             if active_stroke is not None:
                 frame_mask = reveal_mask.copy()
                 draw_reveal_stroke(frame_mask, active_stroke, settings, progress=active_progress)
-            apply_target_reveal(frame, target_reveal, frame_mask, frame_idx, total_frames, settings)
+            apply_target_reveal(frame, target_reveal, frame_mask, frame_idx, total_frames, settings, guided_sections=guided_sections)
 
         if active_state is None:
             active_state = reposition_hand_state(render_strokes, last_completed_index, t, settings)
@@ -467,7 +468,15 @@ def draw_reveal_stroke(mask: Image.Image, stroke: Stroke, settings: RenderSettin
         draw.line(points, fill=210, width=width + 18, joint="curve")
 
 
-def apply_target_reveal(frame: Image.Image, target_reveal: Image.Image, local_mask: Image.Image, frame_idx: int, total_frames: int, settings: RenderSettings) -> None:
+def apply_target_reveal(
+    frame: Image.Image,
+    target_reveal: Image.Image,
+    local_mask: Image.Image,
+    frame_idx: int,
+    total_frames: int,
+    settings: RenderSettings,
+    guided_sections: bool = False,
+) -> None:
     progress = 1.0 if total_frames <= 1 else frame_idx / max(1, total_frames - 1)
     strength = max(0.0, min(1.0, getattr(settings, "target_reveal_strength", 85) / 100.0))
     soft_mask = local_mask.filter(ImageFilter.GaussianBlur(radius=8 + strength * 10))
@@ -475,9 +484,11 @@ def apply_target_reveal(frame: Image.Image, target_reveal: Image.Image, local_ma
 
     # A gentle catch-up near the end guarantees the last frame contains target
     # details that the extracted stroke set may have missed.
-    catch_up = max(0.0, min(1.0, (progress - 0.78) / 0.22))
+    catch_start = 0.94 if guided_sections else 0.78
+    catch_span = 1.0 - catch_start
+    catch_up = max(0.0, min(1.0, (progress - catch_start) / max(0.01, catch_span)))
     catch_up = catch_up * catch_up * (3 - 2 * catch_up)
-    ambient_reveal = (progress ** 1.7) * 0.16 * strength
+    ambient_reveal = 0.0 if guided_sections else (progress ** 1.7) * 0.16 * strength
     reveal = np.maximum(mask_arr, catch_up)
     reveal = np.maximum(reveal, ambient_reveal)
 

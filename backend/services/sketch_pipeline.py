@@ -313,7 +313,7 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if not strokes:
         strokes.extend(create_fallback_strokes(settings, rng))
 
-    apply_semantic_region_detection(strokes, semantic_regions, section_polygons(art_director, settings.width, settings.height))
+    apply_semantic_region_detection(strokes, semantic_regions, section_polygon_rules(art_director, settings.width, settings.height))
     apply_art_director_to_strokes(strokes, art_director, settings)
     apply_professional_stroke_polish(strokes, settings)
 
@@ -325,7 +325,7 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
     if not section_guided:
         apply_guided_artist_sequence(strokes, subject, settings, art_director)
     assign_timing(strokes, settings, rng)
-    summary = summarize_passes(strokes)
+    summary = summarize_section_passes(strokes, art_director) if section_guided else summarize_passes(strokes)
 
     warnings = []
     if len(strokes) < 80:
@@ -356,14 +356,23 @@ def make_stroke_plan(image_bytes: bytes, settings: RenderSettings) -> tuple[Stro
 
 
 
-def apply_semantic_region_detection(strokes: list[Stroke], semantic_regions: list[SemanticRegion], polygons: dict[str, list[tuple[float, float]]] | None = None) -> None:
+def apply_semantic_region_detection(
+    strokes: list[Stroke],
+    semantic_regions: list[SemanticRegion],
+    polygon_rules: list[tuple[str, list[tuple[float, float]]]] | None = None,
+) -> None:
     if not semantic_regions:
         return
-    polygons = polygons or {}
+    polygon_rules = polygon_rules or []
+    by_name = {region.name: region for region in semantic_regions}
     for stroke in strokes:
         x1, y1, x2, y2 = stroke.bbox
         center = ((x1 + x2) / 2, (y1 + y2) / 2)
-        region = next((candidate for candidate in semantic_regions if candidate.name in polygons and point_in_polygon(center, polygons[candidate.name])), None)
+        region = None
+        for region_name, polygon in polygon_rules:
+            if stroke_touches_polygon(stroke, center, polygon):
+                region = by_name.get(region_name)
+                break
         if region is None:
             region = select_region_for_stroke(stroke.bbox, center, semantic_regions)
         if region is None:
@@ -373,19 +382,20 @@ def apply_semantic_region_detection(strokes: list[Stroke], semantic_regions: lis
         stroke.order_score = min(stroke.order_score, LAYER_WEIGHT.get(stroke.layer, 50) + region.priority)
 
 
-def section_polygons(plan: dict[str, object], width: int, height: int) -> dict[str, list[tuple[float, float]]]:
+def section_polygon_rules(plan: dict[str, object], width: int, height: int) -> list[tuple[str, list[tuple[float, float]]]]:
     sequence = plan.get("section_sequence") if plan else None
     if not isinstance(sequence, list):
-        return {}
-    polygons: dict[str, list[tuple[float, float]]] = {}
-    for raw in sequence:
+        return []
+    rules: list[tuple[float, int, str, list[tuple[float, float]]]] = []
+    for idx, raw in enumerate(sequence):
         if not isinstance(raw, dict):
             continue
         region = str(raw.get("region", "")).strip()
         polygon = polygon_from_section(raw, width, height)
         if region and polygon:
-            polygons[region] = polygon
-    return polygons
+            rules.append((safe_float(raw.get("order"), idx + 1), idx, region, polygon))
+    rules.sort(key=lambda row: (row[0], row[1]))
+    return [(region, polygon) for _, _, region, polygon in rules]
 
 
 def polygon_from_section(raw: dict[str, object], width: int, height: int) -> list[tuple[float, float]]:
@@ -399,6 +409,20 @@ def polygon_from_section(raw: dict[str, object], width: int, height: int) -> lis
         points = parse_polygon_points(polygon_pct)
         if len(points) >= 3:
             return [(max(0, min(width - 1, x / 100 * width)), max(0, min(height - 1, y / 100 * height))) for x, y in points]
+    bbox = raw.get("bbox")
+    if isinstance(bbox, list) and len(bbox) == 4:
+        vals = [safe_float(value, 0) for value in bbox]
+        x1, y1, x2, y2 = clamp_bbox(vals[0], vals[1], vals[2], vals[3], width, height)
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    bbox_pct = raw.get("bbox_pct")
+    if isinstance(bbox_pct, list) and len(bbox_pct) == 4:
+        vals = [safe_float(value, 0) for value in bbox_pct]
+        x1 = vals[0] / 100 * width
+        y1 = vals[1] / 100 * height
+        x2 = (vals[0] + vals[2]) / 100 * width
+        y2 = (vals[1] + vals[3]) / 100 * height
+        x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, width, height)
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     return []
 
 
@@ -421,6 +445,15 @@ def point_in_polygon(point: tuple[float, float], polygon: list[tuple[float, floa
             inside = not inside
         j = i
     return inside
+
+
+def stroke_touches_polygon(stroke: Stroke, center: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
+    samples = [center]
+    if stroke.points:
+        step = max(1, len(stroke.points) // 8)
+        samples.extend(stroke.points[::step])
+        samples.append(stroke.points[-1])
+    return any(point_in_polygon(point, polygon) for point in samples)
 
 
 def apply_section_region_overrides(semantic_regions: list[SemanticRegion], plan: dict[str, object], width: int, height: int) -> None:
@@ -588,6 +621,7 @@ def apply_section_guidance(strokes: list[Stroke], subject: str, settings: Render
         }
     if not region_rules:
         return False
+    max_rule_order = max(safe_float(rule.get("order"), 0) for rule in region_rules.values())
 
     layer_phase = {
         "layout": -0.20,
@@ -598,11 +632,11 @@ def apply_section_guidance(strokes: list[Stroke], subject: str, settings: Render
         "shading": 0.58,
         "accent": 0.78,
     }
-    late_shading_base = (len(region_rules) + 1) * 1000
+    late_shading_base = (max_rule_order + 1) * 1000
     for stroke in strokes:
         rule = region_rules.get(stroke.region)
         if not rule:
-            stroke.order_score += len(region_rules) * 1000 + region_order_key(stroke.region, subject)[0] * 30
+            stroke.order_score = (max_rule_order + 2) * 1000 + region_order_key(stroke.region, subject)[0] * 30 + stroke.bbox[1] * 0.01 + stroke.bbox[0] * 0.002
             continue
         mode = str(rule.get("mode", "complete"))
         if mode == "skip":
@@ -1407,6 +1441,53 @@ def summarize_passes(strokes: list[Stroke]) -> list[dict[str, object]]:
                 "end_ms": max(s.end_ms for s in layer_strokes),
             })
     return summary
+
+
+def summarize_section_passes(strokes: list[Stroke], plan: dict[str, object]) -> list[dict[str, object]]:
+    sequence = plan.get("section_sequence") if plan else None
+    if not isinstance(sequence, list):
+        return summarize_passes(strokes)
+
+    rows: list[tuple[float, int, str, str]] = []
+    for idx, raw in enumerate(sequence):
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "")).strip()
+        if not region:
+            continue
+        mode = str(raw.get("mode", "complete")).replace("_", " ")
+        rows.append((safe_float(raw.get("order"), idx + 1), idx, region, mode))
+    if not rows:
+        return summarize_passes(strokes)
+
+    summary: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for order, _, region, mode in sorted(rows, key=lambda row: (row[0], row[1])):
+        section_strokes = [stroke for stroke in strokes if stroke.region == region and stroke.opacity > 0]
+        seen.add(region)
+        if not section_strokes:
+            continue
+        label = region.replace("_", " ").title()
+        summary.append({
+            "id": region,
+            "name": f"{int(order) if order.is_integer() else order:g}. {label}",
+            "description": f"Guided section pass: {mode}.",
+            "stroke_count": len(section_strokes),
+            "start_ms": min(stroke.start_ms for stroke in section_strokes),
+            "end_ms": max(stroke.end_ms for stroke in section_strokes),
+        })
+
+    extra_strokes = [stroke for stroke in strokes if stroke.region not in seen and stroke.opacity > 0]
+    if extra_strokes:
+        summary.append({
+            "id": "unguided_finish",
+            "name": "Unguided finishing marks",
+            "description": "Remaining strokes outside the edited section boundaries.",
+            "stroke_count": len(extra_strokes),
+            "start_ms": min(stroke.start_ms for stroke in extra_strokes),
+            "end_ms": max(stroke.end_ms for stroke in extra_strokes),
+        })
+    return summary or summarize_passes(strokes)
 
 
 def limit_strokes(strokes: list[Stroke], max_strokes: int) -> list[Stroke]:
